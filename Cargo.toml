@@ -1,0 +1,10 @@
+[package]
+name = "rust_nomad_events_api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = { version = "0.8.7", features = ["http2", "macros", "ws"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.48.0", features = ["full"] }
+uuid = "1.18.1"
