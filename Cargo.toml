@@ -8,3 +8,10 @@ axum = { version = "0.8.7", features = ["http2", "macros", "ws"] }
 serde = { version = "1.0.228", features = ["derive"] }
 tokio = { version = "1.48.0", features = ["full"] }
 uuid = "1.18.1"
+serde_json = "1.0"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "compression-full", "timeout"] }
+chrono = { version = "0.4.42", features = ["serde"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
