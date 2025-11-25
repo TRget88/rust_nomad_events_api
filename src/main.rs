@@ -1,203 +1,98 @@
-///This is a simple api that can be used to pull event information
-///
-use axum::{
-    body::Body,
-    Json, Router,
-    extract::{Path, State},
-    http::{Request, StatusCode},
-    response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
-    middleware::{self, Next},
-};
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
-//use tower_http::cors::CorsLayer;
-use chrono::NaiveDate;
-use std::time::Duration;
-use tower_http::{
-    compression::CompressionLayer, cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer,
-};
+// Project Structure:
+// src/
+// ├── main.rs                 // Application entry point & routing
+// ├── handlers/               // HTTP handlers (controllers)
+// │   ├── mod.rs
+// │   └── event_handlers.rs
+// ├── services/               // Business logic layer
+// │   ├── mod.rs
+// │   └── event_service.rs
+// ├── repositories/           // Data access layer
+// │   ├── mod.rs
+// │   └── event_repository.rs
+// ├── models/                 // Domain models
+// │   ├── mod.rs
+// │   ├── event_models.rs
+// │   └── dto.rs             // Data Transfer Objects
+// └── errors/                 // Error handling
+//     ├── mod.rs
+//     └── app_error.rs
 
+
+// ============================================================================
+// src/main.rs - Application Entry Point
+// ============================================================================
+use std::sync::Arc; 
+
+use axum::{
+    routing::{get, post, put, delete},
+    Router,
+    Json,
+};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use sqlx::sqlite::SqlitePoolOptions;
+use tower_http::cors::CorsLayer;
+use tower_http::trace::TraceLayer;
 
 mod models;
-use models::event_models::*;
+mod errors;
+mod repositories;
+mod services;
+mod handlers;
 
-///router
-async fn set_router(state: AppState) -> Router {
-    Router::new()
-        .route("/", get(root))
-        .route(
-            "/events", 
-            get(get_all_events)
-        //.post(create_event)
-        )
-        .route(
-            "/events/{id}",
-            get(get_event)//.put(update_event).delete(delete_event),
-        )
-        .route("/health", get(health_check))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .layer(CompressionLayer::new())
-        .layer(TimeoutLayer::new(Duration::from_secs(30)))
-        .layer(middleware::from_fn(logging_middleware))
-        .with_state(state)
-}
+use repositories::EventRepository;
+use services::EventService;
+use handlers::event_handlers::*;
 
-// Application state to hold our events
-#[derive(Clone)]
-struct AppState {
-    events: Arc<Mutex<Vec<NomEvent>>>,
-}
+mod test_data;
+use test_data::seed_database;
 
 #[tokio::main]
 async fn main() {
-    // Initialize state
-    let state = AppState {
-        events: Arc::new(Mutex::new(Vec::new())),
-    };
+    tracing_subscriber::fmt::init();
 
-    // Build our application with routes - Moved
-    //let app = Router::new()
-        //.route("/", get(root))
-        //.route("/events", get(get_all_events).post(create_event))
-        //.route(
-            //"/events/{id}",
-            //get(get_event).put(update_event).delete(delete_event),
-        //)
-        //.route("/health", get(health_check))
-        //.layer(CorsLayer::permissive())
-        //.with_state(state);
+    // Database setup
+    let db = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect("sqlite://events.db")
+        .await
+        .expect("Failed to connect to database");
 
-    let app = set_router(state).await;
+    sqlx::migrate!("./migrations")
+        .run(&db)
+        .await
+        .expect("Failed to run migrations");
 
-    // Run the server
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    // Seed database with test data (uncomment to run once)
+    seed_database(&db).await.expect("Failed to seed database");
 
+    // Build layers: Repository -> Service
+    let repository = EventRepository::new(db);
+    let service = Arc::new(EventService::new(repository));
+
+    // Build router
+    let app = Router::new()
+        .route("/", get(|| async { "Festival Events API" }))
+        .route("/health", get(health_check))
+        .route("/events", get(get_all_events).post(create_event))
+        .route("/events/search", get(search_events))
+        .route("/events/{id}", get(get_event).put(update_event).delete(delete_event))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(service);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+        .await
+        .unwrap();
+    
     println!("🚀 Server running on http://localhost:3000");
-
+    
     axum::serve(listener, app).await.unwrap();
 }
 
-// Root endpoint
-async fn root() -> &'static str {
-    "Festival Events API - Use /events for event operations"
-}
-
-// Health check endpoint
 async fn health_check() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "healthy",
-            "service": "festival-events-api"
-        })),
-    )
+    (StatusCode::OK, Json(serde_json::json!({
+        "status": "healthy"
+    })))
 }
-
-/// GET /events - Get all events
-async fn get_all_events(State(state): State<AppState>) -> impl IntoResponse {
-    let events = state.events.lock().unwrap();
-    let events_copy: Vec<NomEvent> = events.iter().cloned().collect();
-    (StatusCode::OK, Json(events_copy))
-}
-
-/// GET /events/:id - Get a specific event
-async fn get_event(Path(id): Path<usize>, State(state): State<AppState>) -> impl IntoResponse {
-    let events = state.events.lock().unwrap();
-
-    match events.get(id) {
-        Some(event) => (StatusCode::OK, Json(event)).into_response(),
-        None => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({
-                "error": "Event not found"
-            })),
-        )
-            .into_response(),
-    }
-}
-
-/// POST /events - Create a new event
-//async fn create_event(
-    //State(state): State<AppState>,
-    //Json(payload): Json<NomEvent>,
-//) -> impl IntoResponse {
-    //let mut events = state.events.lock().unwrap();
-    //events.push(payload);
-//
-    //(
-        //StatusCode::CREATED,
-        //Json(serde_json::json!({
-            //"message": "Event created successfully",
-            //"id": events.len() - 1
-        //})),
-    //)
-//}
-
-/// PUT /events/:id - Update an event
-//async fn update_event(
-    //Path(id): Path<usize>,
-    //State(state): State<AppState>,
-    //Json(payload): Json<NomEvent>,
-//) -> impl IntoResponse {
-    //let mut events = state.events.lock().unwrap();
-//
-    //if id < events.len() {
-        //events[id] = payload;
-        //(
-            //StatusCode::OK,
-            //Json(serde_json::json!({
-                //"message": "Event updated successfully"
-            //})),
-        //)
-    //} else {
-        //(
-            //StatusCode::NOT_FOUND,
-            //Json(serde_json::json!({
-                //"error": "Event not found"
-            //})),
-        //)
-    //}
-//}
-
-/// DELETE /events/:id - Delete an event
-//async fn delete_event(Path(id): Path<usize>, State(state): State<AppState>) -> impl IntoResponse {
-    //let mut events = state.events.lock().unwrap();
-//
-    //if id < events.len() {
-        //events.remove(id);
-        //(
-            //StatusCode::OK,
-            //Json(serde_json::json!({
-                //"message": "Event deleted successfully"
-            //})),
-        //)
-    //} else {
-        //(
-            //StatusCode::NOT_FOUND,
-            //Json(serde_json::json!({
-                //"error": "Event not found"
-            //})),
-        //)
-    //}
-//}
-
-// src/models/mod.rs
-//pub mod event_models;
-//pub mod event_modules;
-
-
-///Middleware
-/// Logging
-async fn logging_middleware(
-    req: Request<Body>,
-    next: Next,
-) -> Response {
-    println!("Request: {} {}", req.method(), req.uri());
-    let response = next.run(req).await;
-    println!("Response: {}", response.status());
-    response
-}
-/// Rout specific - Not needed yet. Going to just use Gets now and will post in a different way.
-fn stop_throwing_error(){}
