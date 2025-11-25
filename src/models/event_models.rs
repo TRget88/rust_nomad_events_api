@@ -10,7 +10,7 @@ pub struct NomEvent {
     pub website: Option<String>,
     pub date_info: EventDate,
     pub location_info: Location,
-    pub amenities: Amenities,
+    pub amenities:  Option<Amenities>,
     pub camping_info: Option<CampingInfo>,
 }
 ///Self explanitory
@@ -33,7 +33,7 @@ pub struct EventType {
 }
 
 
-///using the address or the long and lat to get an address so we can tell poeple what events are nearby
+///using the address or the long and lat to get an address so we can tell people what events are nearby
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Location {
     pub address: String,
