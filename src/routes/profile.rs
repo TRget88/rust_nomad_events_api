@@ -1,7 +1,7 @@
 // src/routes/profile.rs
+use crate::models::user::Claims;
 use axum::{Extension, Json, http::StatusCode};
 use serde::{Deserialize, Serialize};
-use crate::custom_middleware::jwt::Claims;
 
 #[derive(Serialize)]
 pub struct ProfileResponse {

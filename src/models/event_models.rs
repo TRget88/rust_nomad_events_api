@@ -1,29 +1,13 @@
-//## Database Structure:
-//```
-//event_types
-//├── id (PK)
-//├── name (unique)
-//├── description
-//├── map_indicator
-//└── category
-//
-//camping_profiles
-//├── id (PK)
-//├── profile_name (unique)
-//├── description
-//└── camping_data (JSON)
-//
-//events
-//├── id (PK)
-//├── event_type_id (FK)
-//└── camping_profile_id (FK)
-
 ///Nomadic Event, This is the base class/model/struct for the events
-use chrono::NaiveDate;
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, NaiveDate, TimeZone, Utc};
+use serde::{Deserialize, Deserializer, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct NomEvent {
+    #[serde(default)]
+    pub id: Option<i64>,
+    #[serde(default)]
+    pub user_id: Option<String>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -37,13 +21,41 @@ pub struct NomEvent {
     pub location_info: Location,
     pub amenities: Option<Amenities>,
     pub camping_info: Option<CampingInfo>,
+    #[serde(default)]
+    pub archive: bool,
+}
+
+fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s: Option<String> = Option::deserialize(deserializer)?;
+    match s {
+        Some(date_str) => {
+            // Try parsing as DateTime first
+            if let Ok(dt) = DateTime::parse_from_rfc3339(&date_str) {
+                return Ok(Some(dt.with_timezone(&Utc)));
+            }
+
+            // If that fails, try parsing as just a date (YYYY-MM-DD)
+            if let Ok(naive_date) = NaiveDate::parse_from_str(&date_str, "%Y-%m-%d") {
+                let dt = Utc.from_utc_datetime(&naive_date.and_hms_opt(0, 0, 0).unwrap());
+                return Ok(Some(dt));
+            }
+
+            Err(serde::de::Error::custom("Invalid date format"))
+        }
+        None => Ok(None),
+    }
 }
 
 ///Self explanitory
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct EventDate {
-    pub start_date: Option<chrono::NaiveDate>,
-    pub end_date: Option<chrono::NaiveDate>,
+    #[serde(deserialize_with = "deserialize_optional_date")]
+    pub start_date: Option<DateTime<Utc>>,
+    #[serde(deserialize_with = "deserialize_optional_date")]
+    pub end_date: Option<DateTime<Utc>>,
     #[serde(default)]
     pub single_day: bool,
     #[serde(default)]
@@ -141,7 +153,6 @@ pub struct RvCampingOptions {
     pub dump_station: bool,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct VehicleCampingOptions {
     #[serde(default)]
@@ -153,8 +164,6 @@ pub struct VehicleCampingOptions {
     #[serde(default)]
     pub rooftop_tent_allowed: bool,
 }
-
-
 
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct Amenities {
@@ -179,7 +188,6 @@ pub struct Amenities {
     pub laundry: bool,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct GeneratorOptions {
     #[serde(default)]
@@ -200,11 +208,10 @@ pub struct GeneratorOptions {
     pub fuel_storage_restrictions: Option<String>,
 }
 
-
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 pub struct GeneratorQuietHours {
     #[serde(default)]
-    pub all_day_restriction: bool,         // Some events ban them entirely
+    pub all_day_restriction: bool, // Some events ban them entirely
     pub start_time: Option<String>,        // "22:00" or "10:00 PM"
     pub end_time: Option<String>,          // "08:00" or "8:00 AM"
     pub days_of_week: Option<Vec<String>>, // ["Friday", "Saturday"] if different per day
@@ -272,14 +279,14 @@ where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Deserialize as DeserializeTrait;
-    
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum HookupValue {
         Bool(bool),
         Object(Hookups),
     }
-    
+
     match Option::<HookupValue>::deserialize(deserializer)? {
         None => Ok(None),
         Some(HookupValue::Bool(true)) => Ok(Some(Hookups {
@@ -294,19 +301,21 @@ where
 }
 
 // After GeneratorOptions and GeneratorQuietHours structs
-fn deserialize_generator_options<'de, D>(deserializer: D) -> Result<Option<GeneratorOptions>, D::Error>
+fn deserialize_generator_options<'de, D>(
+    deserializer: D,
+) -> Result<Option<GeneratorOptions>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::Deserialize as DeserializeTrait;
-    
+
     #[derive(Deserialize)]
     #[serde(untagged)]
     enum GeneratorValue {
         Bool(bool),
         Object(GeneratorOptions),
     }
-    
+
     match Option::<GeneratorValue>::deserialize(deserializer)? {
         None => Ok(None),
         Some(GeneratorValue::Bool(true)) => Ok(Some(GeneratorOptions {

@@ -5,17 +5,17 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
 pub async fn validate_api_key(
     headers: HeaderMap,
     request: Request,
     next: Next,
 ) -> Result<Response, StatusCode> {
-//println!("########################################################################################################");
+    //println!("########################################################################################################");
     //println!("🔐 API Key Middleware - Request received");
     //println!("📋 Headers: {:?}", headers);
- //println!("-------------------------------------------------------------------------------------------------------");
+    //println!("-------------------------------------------------------------------------------------------------------");
     let api_key = headers
         .get("X-API-Key")
         .and_then(|v| v.to_str().ok())
@@ -23,9 +23,9 @@ pub async fn validate_api_key(
 
     //println!("Key: {:?}", api_key);
     //println!("-------------------------------------------------------------------------------------------------------");
-    let expected_hash = std::env::var("API_KEY_HASH")
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-     //println!("expected_hash: {}", expected_hash);
+    let expected_hash =
+        std::env::var("API_KEY_HASH").map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    //println!("expected_hash: {}", expected_hash);
     //println!("-------------------------------------------------------------------------------------------------------");
     let mut hasher = Sha256::new();
     hasher.update(api_key.as_bytes());
@@ -35,6 +35,6 @@ pub async fn validate_api_key(
     if provided_hash != expected_hash {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    
+
     Ok(next.run(request).await)
 }

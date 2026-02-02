@@ -2,23 +2,16 @@
 // Repository: src/repositories/camping_repository.rs
 // ============================================================================
 
-use sqlx::SqlitePool;
-use crate::models::event_models::CampingProfile;
 use crate::errors::AppError;
+use crate::models::database_models::CampingProfileRow;
+use crate::models::event_models::CampingProfile;
+use sqlx::SqlitePool;
 
-#[derive(sqlx::FromRow)]
-pub struct CampingProfileRow {
-    pub id: i64,
-    pub profile_name: String,
-    pub description: Option<String>,
-    pub camping_data: String,
-}
-
-pub struct CampingRepository {
+pub struct CampingProfileContext {
     pool: SqlitePool,
 }
 
-impl CampingRepository {
+impl CampingProfileContext {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
@@ -44,7 +37,7 @@ impl CampingRepository {
 
     pub async fn find_by_id(&self, id: i64) -> Result<CampingProfile, AppError> {
         let row = sqlx::query_as::<_, CampingProfileRow>(
-            "SELECT id, profile_name, description, camping_data FROM camping_profiles WHERE id = ?"
+            "SELECT id, profile_name, description, camping_data FROM camping_profiles WHERE id = ?",
         )
         .bind(id)
         .fetch_one(&self.pool)

@@ -1,32 +1,24 @@
 // ============================================================================
-// Repository: src/repositories/event_type_repository.rs
+// Repository: src/context/event_type_repository.rs
 // ============================================================================
 
-use sqlx::SqlitePool;
-use crate::models::event_models::EventType;
 use crate::errors::AppError;
+use crate::models::database_models::EventTypeRow;
+use crate::models::event_models::EventType;
+use sqlx::SqlitePool;
 
-#[derive(sqlx::FromRow)]
-pub struct EventTypeRow {
-    pub id: i64,
-    pub name: String,
-    pub description: String,
-    pub map_indicator: String,
-    pub category: String,
-}
-
-pub struct EventTypeRepository {
+pub struct EventTypeContext {
     pool: SqlitePool,
 }
 
-impl EventTypeRepository {
+impl EventTypeContext {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
 
     pub async fn find_all(&self) -> Result<Vec<EventType>, AppError> {
         let rows = sqlx::query_as::<_, EventTypeRow>(
-            "SELECT id, name, description, map_indicator, category FROM event_types"
+            "SELECT id, name, description, map_indicator, category FROM event_types",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -47,7 +39,7 @@ impl EventTypeRepository {
 
     pub async fn find_by_id(&self, id: i64) -> Result<EventType, AppError> {
         let row = sqlx::query_as::<_, EventTypeRow>(
-            "SELECT id, name, description, map_indicator, category FROM event_types WHERE id = ?"
+            "SELECT id, name, description, map_indicator, category FROM event_types WHERE id = ?",
         )
         .bind(id)
         .fetch_one(&self.pool)
@@ -64,7 +56,7 @@ impl EventTypeRepository {
 
     pub async fn find_by_name(&self, name: &str) -> Result<Option<EventType>, AppError> {
         let result = sqlx::query_as::<_, EventTypeRow>(
-            "SELECT id, name, description, map_indicator, category FROM event_types WHERE name = ?"
+            "SELECT id, name, description, map_indicator, category FROM event_types WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)

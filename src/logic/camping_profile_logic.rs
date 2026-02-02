@@ -1,17 +1,18 @@
 // ============================================================================
-// Service: src/services/camping_service.rs
+// Service: src/logic/camping_service.rs
 // ============================================================================
 
+use crate::context::CampingProfileContext;
 use crate::models::event_models::CampingProfile;
-use crate::repositories::CampingRepository;
+//use crate::repositories::CampingRepository;
 use crate::errors::AppError;
 
-pub struct CampingService {
-    repository: CampingRepository,
+pub struct CampingProfileLogic {
+    repository: CampingProfileContext,
 }
 
-impl CampingService {
-    pub fn new(repository: CampingRepository) -> Self {
+impl CampingProfileLogic {
+    pub fn new(repository: CampingProfileContext) -> Self {
         Self { repository }
     }
 
@@ -26,7 +27,9 @@ impl CampingService {
     pub async fn create_profile(&self, profile: CampingProfile) -> Result<i64, AppError> {
         // Validate profile name is not empty
         if profile.profile_name.trim().is_empty() {
-            return Err(AppError::ValidationError("Profile name cannot be empty".to_string()));
+            return Err(AppError::ValidationError(
+                "Profile name cannot be empty".to_string(),
+            ));
         }
 
         self.repository.create(&profile).await
@@ -34,11 +37,13 @@ impl CampingService {
 
     pub async fn update_profile(&self, id: i64, profile: CampingProfile) -> Result<(), AppError> {
         if profile.profile_name.trim().is_empty() {
-            return Err(AppError::ValidationError("Profile name cannot be empty".to_string()));
+            return Err(AppError::ValidationError(
+                "Profile name cannot be empty".to_string(),
+            ));
         }
 
         let updated = self.repository.update(id, &profile).await?;
-        
+
         if !updated {
             return Err(AppError::NotFound("Camping profile not found".to_string()));
         }
@@ -48,7 +53,7 @@ impl CampingService {
 
     pub async fn delete_profile(&self, id: i64) -> Result<(), AppError> {
         let deleted = self.repository.delete(id).await?;
-        
+
         if !deleted {
             return Err(AppError::NotFound("Camping profile not found".to_string()));
         }
