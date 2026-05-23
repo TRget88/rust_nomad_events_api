@@ -1,23 +1,24 @@
 // ============================================================================
 // src/logic/microevent_logic.rs - Business Logic Layer
 // ============================================================================
-use crate::errors::AppError;
-//use crate::models::dto::MicroeventResponse;
 use crate::context::MicroeventContext;
-use crate::logic::{UserCollectionLogic, user_collection_logic};
+use crate::errors::AppError;
+use crate::logic::UserCollectionLogic;
 use crate::models::microevents_models::Microevent;
-use crate::models::user::Claims;
-use serde_json::json;
+use crate::models::user::{Claims, UserRole};
 use std::sync::Arc;
-use uuid::Uuid;
 pub struct MicroeventLogic {
-    context: MicroeventContext,
+    // `Arc<MicroeventContext>` mirrors the `EventContext` Arc pattern in
+    // `EventLogic` — `UserCollectionLogic` also references the same context
+    // instance for its microevent-lookup paths, so both share one
+    // construction in `main.rs`.
+    context: Arc<MicroeventContext>,
     user_collection_logic: Arc<UserCollectionLogic>,
 }
 
 impl MicroeventLogic {
     pub fn new(
-        context: MicroeventContext,
+        context: Arc<MicroeventContext>,
         user_collection_logic: Arc<UserCollectionLogic>,
     ) -> Self {
         Self {
@@ -26,15 +27,15 @@ impl MicroeventLogic {
         }
     }
 
-    pub async fn get_all(&self) -> Result<Vec<Microevent>, AppError> {
-        let rows = self.context.find_all().await?;
+    pub async fn get_all(
+        &self,
+        limit: Option<i64>,
+        offset: Option<i64>,
+    ) -> Result<Vec<Microevent>, AppError> {
+        let (l, o) = crate::util::validate_pagination(limit, offset)?;
+        let rows = self.context.find_all(l, o).await?;
 
-        let events: Vec<Microevent> = rows
-            .into_iter()
-            //.filter_map(|row| Microevent::from_row(row).ok())
-            .collect();
-
-        Ok(events)
+        Ok(rows.into_iter().collect())
     }
 
     pub async fn get(&self, id: i64) -> Result<Microevent, AppError> {
@@ -50,9 +51,9 @@ impl MicroeventLogic {
     }
 
     pub async fn get_by_event(&self, id: i64) -> Result<Vec<Microevent>, AppError> {
-        println!("About to make row request");
+        tracing::debug!(event_id = id, "About to fetch microevents by event");
         let rows = self.context.find_by_event(id).await?;
-        println!("number of rows found: {}", rows.iter().count());
+        tracing::debug!(count = rows.len(), "Microevents fetched");
 
         let events: Vec<Microevent> = rows
             .into_iter()
@@ -84,22 +85,12 @@ impl MicroeventLogic {
         // Business logic: validate event data
         self.validate_event(&event)?;
 
-        // Check if user is admin or superadmin (bypass ownership check)
-        let is_admin = claims.role == "admin" || claims.role == "super_admin";
-
-        if !is_admin {
-            // Check if the user is the owner (correct Id is listed in their usercollection)
-            let collection = self.user_collection_logic.get(&claims.sub).await?;
-
-            // Check if this id is part of the user's created microevents
-            let is_owner = collection.created_microevents.contains(&id);
-
-            if !is_owner {
-                return Err(AppError::Unauthorized(
-                    "You do not have permission to update this microevent".to_string(),
-                ));
-            }
-        }
+        // Ownership gate: admins/superadmins bypass; everyone else must
+        // own the row. Backed by the `microevents.user_id` column —
+        // querying the column directly is uniform with how every other
+        // table checks ownership and removes the JSON-blob round-trip
+        // through `user_collection`.
+        self.require_owner_or_admin(id, &claims).await?;
 
         let updated = self.context.update(id, &event).await?;
 
@@ -111,28 +102,17 @@ impl MicroeventLogic {
     }
 
     pub async fn delete(&self, id: i64, claims: Claims) -> Result<(), AppError> {
-        // Check if user is admin or superadmin (bypass ownership check)
-        let is_admin = claims.role == "admin" || claims.role == "super_admin";
-        if !is_admin {
-            // Check if the user is the owner (correct Id is listed in their usercollection)
-            let collection = self.user_collection_logic.get(&claims.sub).await?;
-
-            // Check if this id is part of the user's created microevents
-            let is_owner = collection.created_microevents.contains(&id);
-
-            if !is_owner {
-                return Err(AppError::Unauthorized(
-                    "You do not have permission to update this microevent".to_string(),
-                ));
-            }
-        }
+        self.require_owner_or_admin(id, &claims).await?;
 
         let deleted = self.context.delete(id).await?;
 
         if !deleted {
             return Err(AppError::NotFound("Event not found".to_string()));
         } else {
-            //send this data to the usercollection
+            // Keep the user_collection JSON denormalization in lock-step
+            // — the frontend reads it for the profile "Created" tab even
+            // though we no longer use it for ownership decisions. Best-
+            // effort: a write failure here doesn't undo the delete.
             self.user_collection_logic
                 .remove_microevent_ownership(id, &claims.sub)
                 .await?;
@@ -141,31 +121,172 @@ impl MicroeventLogic {
         Ok(())
     }
 
-    // Private business logic methods
-    fn validate_event(&self, event: &Microevent) -> Result<(), AppError> {
-        if event.name.trim().is_empty() {
-            return Err(AppError::ValidationError(
-                "Event name cannot be empty".to_string(),
+    /// Reject the request unless `claims.sub` owns microevent `id` or holds
+    /// an Admin/SuperAdmin role. Ownership is determined by `microevents.user_id`
+    /// — single-column compare against the JWT subject. If the microevent
+    /// doesn't exist, surface `NotFound` rather than `Unauthorized` so the
+    /// 404 path is the same whether the caller is a logged-in stranger or
+    /// the rightful owner of a deleted row.
+    async fn require_owner_or_admin(&self, id: i64, claims: &Claims) -> Result<(), AppError> {
+        if matches!(claims.role, UserRole::Admin | UserRole::SuperAdmin) {
+            return Ok(());
+        }
+
+        let row = self.context.find_by_id(id).await?;
+        if row.user_id != claims.sub {
+            return Err(AppError::Unauthorized(
+                "You do not have permission to modify this microevent".to_string(),
             ));
         }
-        // Validate dates
-        //if let (Some(start), Some(end)) = (event.start_time, event.end_time) {
-        //if end < start {
-        //return Err(AppError::ValidationError(
-        //"End date cannot be before start date".to_string(),
-        //));
-        //}
-        //}
-        //if (event.date_info.start_date != Option::None) {
-        //if let Some(end_date) = event.date_info.end_date {
-        //if end_date < event.date_info.start_date.expect("REASON") {
-        //return Err(AppError::ValidationError(
-        //"End date cannot be before start date".to_string(),
-        //));
-        //}
-        //}
-        //}
-
         Ok(())
+    }
+
+    // Private business logic methods
+    fn validate_event(&self, event: &Microevent) -> Result<(), AppError> {
+        validate_microevent(event)
+    }
+}
+
+/// Free-function validator, separated from `MicroeventLogic` so it can be
+/// unit-tested without instantiating a context. Mirrors the shape of
+/// `event_logic::validate_event` — same field-length bounds, same
+/// reject-on-ordering rule for start/end.
+pub(crate) fn validate_microevent(event: &Microevent) -> Result<(), AppError> {
+    // Field bounds — match the API-level event validator so a microevent
+    // can't push a megabyte payload through the bind protocol when the
+    // parent event can't. The number choice is the same as `validate_event`
+    // (200 / 5000) so a future change is one-line in both places.
+    const MAX_NAME_LEN: usize = 200;
+    const MAX_DESC_LEN: usize = 5000;
+
+    if event.name.trim().is_empty() {
+        return Err(AppError::ValidationError(
+            "Microevent name cannot be empty".to_string(),
+        ));
+    }
+    if event.name.len() > MAX_NAME_LEN {
+        return Err(AppError::ValidationError(format!(
+            "Microevent name must be {} characters or fewer",
+            MAX_NAME_LEN
+        )));
+    }
+
+    if let Some(desc) = event.description.as_ref()
+        && desc.len() > MAX_DESC_LEN
+    {
+        return Err(AppError::ValidationError(format!(
+            "Microevent description must be {} characters or fewer",
+            MAX_DESC_LEN
+        )));
+    }
+
+    // start_time / end_time are both Optional. Only enforce ordering when
+    // both are provided — a microevent with only a start ("show begins at
+    // 9pm, runs as long as the crowd stays") is a legitimate shape.
+    if let (Some(start), Some(end)) = (event.start_time, event.end_time)
+        && end < start
+    {
+        return Err(AppError::ValidationError(
+            "End time cannot be before start time".to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn make_microevent(name: &str) -> Microevent {
+        Microevent {
+            id: 0,
+            event_id: 1,
+            user_id: "owner".to_string(),
+            name: name.to_string(),
+            archive: false,
+            description: None,
+            start_time: None,
+            end_time: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[test]
+    fn rejects_empty_name() {
+        let err = validate_microevent(&make_microevent("")).unwrap_err();
+        assert!(matches!(err, AppError::ValidationError(_)));
+    }
+
+    #[test]
+    fn rejects_whitespace_only_name() {
+        let err = validate_microevent(&make_microevent("   ")).unwrap_err();
+        assert!(matches!(err, AppError::ValidationError(_)));
+    }
+
+    #[test]
+    fn rejects_oversize_name() {
+        let big = "x".repeat(500);
+        let err = validate_microevent(&make_microevent(&big)).unwrap_err();
+        assert!(matches!(err, AppError::ValidationError(_)));
+    }
+
+    #[test]
+    fn rejects_oversize_description() {
+        let mut event = make_microevent("Jousting");
+        event.description = Some("d".repeat(6000));
+        let err = validate_microevent(&event).unwrap_err();
+        assert!(matches!(err, AppError::ValidationError(_)));
+    }
+
+    #[test]
+    fn rejects_end_before_start() {
+        let mut event = make_microevent("Jousting");
+        event.start_time = Some(Utc.with_ymd_and_hms(2026, 6, 15, 18, 0, 0).unwrap());
+        event.end_time = Some(Utc.with_ymd_and_hms(2026, 6, 15, 17, 0, 0).unwrap());
+        let err = validate_microevent(&event).unwrap_err();
+        assert!(matches!(err, AppError::ValidationError(_)));
+    }
+
+    #[test]
+    fn accepts_start_only() {
+        // Open-ended microevent — only a start time, no end. Realistic
+        // shape for "show begins at X" listings.
+        let mut event = make_microevent("Open Mic");
+        event.start_time = Some(Utc.with_ymd_and_hms(2026, 6, 15, 21, 0, 0).unwrap());
+        event.end_time = None;
+        assert!(validate_microevent(&event).is_ok());
+    }
+
+    #[test]
+    fn accepts_end_only() {
+        // Documents the lack-of-ordering check when only end is provided.
+        // Unusual but not invalid — could mean "ends by Y, start TBA".
+        let mut event = make_microevent("Open Mic");
+        event.start_time = None;
+        event.end_time = Some(Utc.with_ymd_and_hms(2026, 6, 15, 23, 0, 0).unwrap());
+        assert!(validate_microevent(&event).is_ok());
+    }
+
+    #[test]
+    fn accepts_equal_start_end() {
+        // A zero-duration microevent (a single moment) is allowed — `end < start`
+        // is rejected, not `end <= start`. Pin the boundary.
+        let mut event = make_microevent("Pyrotechnic Cue");
+        let t = Utc.with_ymd_and_hms(2026, 6, 15, 22, 0, 0).unwrap();
+        event.start_time = Some(t);
+        event.end_time = Some(t);
+        assert!(validate_microevent(&event).is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_microevent() {
+        let mut event = make_microevent("Jousting");
+        event.description = Some("Knights tilt at 2pm and 5pm.".to_string());
+        event.start_time = Some(Utc.with_ymd_and_hms(2026, 6, 15, 14, 0, 0).unwrap());
+        event.end_time = Some(Utc.with_ymd_and_hms(2026, 6, 15, 15, 30, 0).unwrap());
+        assert!(validate_microevent(&event).is_ok());
     }
 }

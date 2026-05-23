@@ -1,5 +1,13 @@
+// This module is a placeholder for the analytics surface — none of the
+// types are wired into routes yet. `analytics_context.rs` carries the
+// only live method (`log_activity`); everything else is staged for the
+// dashboard work tracked in ROADMAP.md → "Analytics implementation".
+//
+// Allowing dead_code here keeps the shapes documented without polluting
+// the build output with 30+ warnings until they actually get consumed.
+#![allow(dead_code)]
+
 use crate::models::database_models::*;
-use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 

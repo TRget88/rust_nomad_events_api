@@ -17,3 +17,14 @@
 /DockerInfo.txt
 /Dockerfile
 /rust_nomad_events_api
+
+# SQLite databases — committed copies (events.db, event.db) need a separate
+# `git rm --cached` to actually untrack, but this prevents new ones from
+# being added.
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Native SQLite CLI binary
+*.exe

@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use crate::AppState;
 use crate::errors::AppError;
-use crate::logic::MicroeventLogic;
-use crate::models::dto::EventQueryParams;
+use crate::extractors::ApiJson;
+use crate::models::dto::PaginationQuery;
 use crate::models::microevents_models::Microevent;
 use crate::models::user::Claims;
 use axum::Extension;
@@ -14,10 +14,18 @@ use axum::{
     response::IntoResponse,
 };
 use serde_json::json;
-use uuid::Uuid;
 
-pub async fn get_all(State(service): State<Arc<AppState>>) -> Result<impl IntoResponse, AppError> {
-    let events = service.microevent_logic.get_all().await?;
+/// Admin-only list of every microevent. Paginated via `?limit=`/`?offset=`
+/// (see [util::validate_pagination]). The user-facing endpoint
+/// `/event/{id}/microevent` already returns the per-event scoped list.
+pub async fn get_all(
+    Query(params): Query<PaginationQuery>,
+    State(service): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let events = service
+        .microevent_logic
+        .get_all(params.limit, params.offset)
+        .await?;
     Ok(Json(events))
 }
 
@@ -40,7 +48,7 @@ pub async fn get(
 pub async fn create(
     Extension(claims): Extension<Claims>,
     State(service): State<Arc<AppState>>,
-    Json(mut event): Json<Microevent>,
+    ApiJson(mut event): ApiJson<Microevent>,
 ) -> Result<impl IntoResponse, AppError> {
     //pull claims data from request
     let user_id = &claims.sub;
@@ -58,11 +66,18 @@ pub async fn create(
     ))
 }
 
+// Variant of `create` that takes the parent event id from the URL path
+// — e.g. `POST /event/{id}/microevent`. Not yet wired into the router
+// (the existing `/microevent` POST takes the parent id in the body),
+// but kept for the planned per-event nested route shape. `_id` is the
+// future event-scoping check; today the body-supplied `event_id` is
+// authoritative.
+#[allow(dead_code)]
 pub async fn create_by_event(
     Extension(claims): Extension<Claims>,
-    Path(id): Path<i64>,
+    Path(_id): Path<i64>,
     State(service): State<Arc<AppState>>,
-    Json(mut event): Json<Microevent>,
+    ApiJson(mut event): ApiJson<Microevent>,
 ) -> Result<impl IntoResponse, AppError> {
     //pull claims data from request
     let user_id = &claims.sub;
@@ -84,7 +99,7 @@ pub async fn update(
     Extension(claims): Extension<Claims>,
     Path(id): Path<i64>,
     State(service): State<Arc<AppState>>,
-    Json(event): Json<Microevent>,
+    ApiJson(event): ApiJson<Microevent>,
 ) -> Result<impl IntoResponse, AppError> {
     service.microevent_logic.update(id, event, claims).await?;
 

@@ -5,23 +5,32 @@ use crate::context::EventContext;
 use crate::context::MicroeventContext;
 use crate::context::UserCollectionContext;
 use crate::errors::AppError;
-//use crate::repositories::EventRepository;
+// Imported from the sibling event_logic module — keeps the "log+drop"
+// behavior consistent with every other list endpoint that builds
+// `Vec<EventResponse>` from a row stream.
+use crate::logic::event_logic::event_response_or_log;
 use crate::models::database_models::UserEventDataRow;
 use crate::models::dto::EventResponse;
 use crate::models::dto::UserCollection;
 use crate::models::microevents_models::Microevent;
-use crate::models::user::Claims;
+use std::sync::Arc;
+
 pub struct UserCollectionLogic {
     repository: UserCollectionContext,
-    events_context: EventContext,
-    microevents_context: MicroeventContext,
+    // `Arc<EventContext>` / `Arc<MicroeventContext>` so the same context
+    // instance shared with `EventLogic` / `MicroeventLogic`. Pre-refactor
+    // `main.rs` constructed each context twice because they aren't Clone;
+    // with Arc both consumers share one allocation and `clone()` is a
+    // refcount bump.
+    events_context: Arc<EventContext>,
+    microevents_context: Arc<MicroeventContext>,
 }
 
 impl UserCollectionLogic {
     pub fn new(
         repository: UserCollectionContext,
-        events_context: EventContext,
-        microevents_context: MicroeventContext,
+        events_context: Arc<EventContext>,
+        microevents_context: Arc<MicroeventContext>,
     ) -> Self {
         Self {
             repository,
@@ -248,10 +257,8 @@ impl UserCollectionLogic {
             .get_by_id_list(preoutput.created_events)
             .await?;
 
-        let output: Vec<EventResponse> = rows
-            .into_iter()
-            .filter_map(|row| EventResponse::from_row(row).ok())
-            .collect();
+        let output: Vec<EventResponse> =
+            rows.into_iter().filter_map(event_response_or_log).collect();
 
         //let output = self
         //.events_logic
@@ -291,10 +298,8 @@ impl UserCollectionLogic {
             .get_by_id_list(preoutput.favorite_events)
             .await?;
 
-        let output: Vec<EventResponse> = rows
-            .into_iter()
-            .filter_map(|row| EventResponse::from_row(row).ok())
-            .collect();
+        let output: Vec<EventResponse> =
+            rows.into_iter().filter_map(event_response_or_log).collect();
         Ok(output)
     }
 
@@ -320,10 +325,8 @@ impl UserCollectionLogic {
             .get_by_id_list(preoutput.saved_events)
             .await?;
 
-        let output: Vec<EventResponse> = rows
-            .into_iter()
-            .filter_map(|row| EventResponse::from_row(row).ok())
-            .collect();
+        let output: Vec<EventResponse> =
+            rows.into_iter().filter_map(event_response_or_log).collect();
 
         Ok(output)
     }

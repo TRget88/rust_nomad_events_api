@@ -7,6 +7,25 @@ use crate::models::database_models::EventRow;
 use crate::models::{event_models::*, microevents_models::Microevent};
 use chrono::{DateTime, Utc};
 
+/// Sort order for `/event/search` results. The value travels through the
+/// API as the lowercase strings `"name"`, `"date"`, `"distance"` — kept as
+/// constants on this enum so callers don't pass raw strings into the
+/// context layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EventSortOrder {
+    #[default]
+    Name,
+    Date,
+    Distance,
+}
+
+// `CreateEventDto` / `UpdateEventDto` / `EventResponseDto` are early
+// sketches of slimmed request/response shapes for the event admin
+// routes. The live admin endpoints currently accept full `NomEvent`
+// payloads (see `routes/events.rs`); these DTOs stay parked until the
+// admin UI calls for a smaller surface. `#[allow(dead_code)]` keeps
+// them documented without producing warnings.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateEventDto {
     pub name: String,
@@ -16,6 +35,7 @@ pub struct CreateEventDto {
     // Add other required fields
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UpdateEventDto {
     pub name: Option<String>,
@@ -25,6 +45,7 @@ pub struct UpdateEventDto {
     // Add other fields that can be updated
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EventResponseDto {
     pub id: i64,
@@ -38,12 +59,50 @@ pub struct EventResponseDto {
 #[derive(Debug, Deserialize)]
 pub struct EventQueryParams {
     pub event_type: Option<i64>,
+    /// Multi-select type filter. Comma-separated event_type ids, e.g.
+    /// `?event_type_ids=1,2,3`. Lets the frontend send "Festivals + Concerts"
+    /// in a single request. When both `event_type` (single) and
+    /// `event_type_ids` (multi) are present, the union is used. Backend
+    /// validates and dedupes; clients send raw user input.
+    pub event_type_ids: Option<String>,
     pub camping_allowed: Option<bool>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub radius_miles: Option<f64>,
+    /// Inclusive lower bound on the event's date range, `YYYY-MM-DD`.
+    /// Matches events whose end_date (or start_date, if end is null) is
+    /// on or after this day — i.e. festivals running through this window.
+    pub date_from: Option<String>,
+    /// Inclusive upper bound on the event's start_date, `YYYY-MM-DD`.
+    /// Combined with `date_from` this gives interval overlap: an event
+    /// running Fri–Sun matches a search for the Saturday it spans.
+    pub date_to: Option<String>,
+    /// Case-insensitive substring match against `events.name` and
+    /// `events.description`. User input is escaped before composing the
+    /// `LIKE` pattern so `%`/`_`/`\` are treated literally.
+    pub name_contains: Option<String>,
+    /// Ordering for the result set. One of `"name"` (default),
+    /// `"date"` (soonest start_date first; null dates last), or
+    /// `"distance"` (nearest to the search lat/lon first). Anything else
+    /// is rejected with 400 in `validate_sort_param`.
+    pub sort: Option<String>,
+    /// Page size cap. Default 200, max 500. Anything outside `[1, 500]`
+    /// is rejected with 400 in `validate_pagination`. Bounds the server's
+    /// response size — without this, a wide-radius search at scale would
+    /// return arbitrary amounts of data per request.
+    pub limit: Option<i64>,
+    /// Zero-indexed row offset for paging. Default 0. Combined with
+    /// `limit` to implement `LIMIT ? OFFSET ?` pagination. v1 is offset-
+    /// based for simplicity; cursor-based pagination (more robust under
+    /// concurrent inserts) is a future upgrade.
+    pub offset: Option<i64>,
 }
 
+// Parked: a future create endpoint planned to accept a camping-profile id
+// + an optional CampingInfo override. The current create path accepts the
+// full event payload — see `routes::events::create_event` — so this DTO
+// is not yet wired.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CreateEventRequest {
     pub name: String,
@@ -55,6 +114,10 @@ pub struct CreateEventRequest {
     pub camping_info: Option<CampingInfo>,        // User can customize after applying template
 }
 
+// Parked: a slim camping-profile list shape. Today `routes::camping_profiles::get_all`
+// returns the full `CampingProfile` rows; this DTO is staged for an "/admin"-side
+// list view where description and id are all the UI needs.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CampingProfileListResponse {
     pub id: i64,
@@ -120,6 +183,9 @@ impl EventResponse {
     //}
 }
 
+// Parked: pre-DTO sketch of the "incoming event with nested EventType"
+// shape. The current create/update routes use `NomEvent` directly.
+#[allow(dead_code)]
 pub struct EventRequest {
     pub id: Option<i64>,
     pub name: String,
@@ -132,7 +198,11 @@ pub struct EventRequest {
     pub camping_info: Option<CampingInfo>,
 }
 
-// This is what we return from the API - includes full EventType object
+// Parked: prepared shape for a `MicroeventResponse` that mirrors the
+// favorite/saved fields on `EventResponse`. Today `routes::microevents`
+// returns `Microevent` directly; this DTO + `from_row` come back online
+// when the favorites surface extends to microevents.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct MicroeventResponse {
     pub id: Option<i64>,
@@ -149,7 +219,9 @@ pub struct MicroeventResponse {
     //pub is_saved: bool,
 }
 
-// Helper to convert Microevent to MicroeventResponse
+// Helper to convert Microevent to MicroeventResponse — parked alongside
+// the parent DTO until callers exist.
+#[allow(dead_code)]
 impl MicroeventResponse {
     pub fn from_row(
         row: Microevent,
@@ -197,6 +269,9 @@ impl MicroeventResponse {
     //}
 }
 
+// Parked: a slimmer create/update shape paired with the staged
+// `MicroeventResponse`. Currently the routes accept `Microevent` directly.
+#[allow(dead_code)]
 pub struct MicroeventRequest {
     pub id: Option<i64>,
     pub event_id: Option<i64>,
@@ -226,11 +301,11 @@ pub struct MicroeventRequest {
 //pub updated_at: Option<DateTime<Utc>>
 //}
 //
-//// Helper to convert EventRow to EventResponse
+/// Helper to convert EventRow to EventResponse
 //impl MicroeventResponse {
 //pub fn from_row(row: crate::context::microevent_context::MicroeventRow) -> Result<Self, serde_json::Error> {
 //
-//// Helper function to parse datetime
+/// Helper function to parse datetime
 //let parse_datetime = |s: Option<String>| -> Option<DateTime<Utc>> {
 //s.and_then(|date_str| {
 //DateTime::parse_from_rfc3339(&date_str)
@@ -251,6 +326,19 @@ pub struct MicroeventRequest {
 //})
 //}
 //}
+/// Shared query DTO for paginated list endpoints (admin user list, admin
+/// audit log, etc.). Endpoints that *also* have other query filters
+/// (`/event/search`) carry their own struct with the same `limit`/`offset`
+/// shape — the duplication is intentional so each endpoint's query type
+/// documents its full surface in one place.
+///
+/// Defaults and validation live in `util::validate_pagination`.
+#[derive(Debug, Deserialize)]
+pub struct PaginationQuery {
+    pub limit: Option<i64>,
+    pub offset: Option<i64>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct UserCollection {
     pub id: Option<i64>,

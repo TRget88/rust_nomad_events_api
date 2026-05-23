@@ -1,14 +1,12 @@
 use crate::AppState;
 use crate::errors::AppError;
-use crate::logic::EventLogic;
-use crate::models::database_models::UserEventDataRow;
+use crate::extractors::ApiJson;
 use crate::models::dto::UserCollection;
 use crate::models::user::Claims;
 use axum::Extension;
 use axum::{
     Json,
-    extract::{Path, Query, State},
-    http::StatusCode,
+    extract::{Path, State},
     response::IntoResponse,
 };
 use serde_json::json;
@@ -28,11 +26,13 @@ pub async fn get(
 pub async fn sync(
     Extension(claims): Extension<Claims>,
     State(service): State<Arc<AppState>>,
-    Json(input): Json<UserCollection>,
+    ApiJson(input): ApiJson<UserCollection>,
 ) -> Result<impl IntoResponse, AppError> {
-    //get the user id
-    let user_id = &claims.sub;
-    //check if user_id and input.user_id are equal
+    // `update_without_ownership` intentionally bypasses the per-user owner
+    // check — `claims.sub` is not consulted here. Documented in the logic
+    // layer; the original `user_id` extraction is left as a marker for the
+    // planned tightening (require `claims.sub == input.user_id`).
+    let _user_id = &claims.sub;
 
     let output = service
         .user_collection_logic
