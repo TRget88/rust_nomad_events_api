@@ -137,6 +137,29 @@ pub struct EventResponse {
     pub location_info: Location,
     pub amenities: Option<Amenities>,
     pub camping_info: Option<CampingInfo>,
+    /// Mirrors `NomEvent.recurring` — surfaces the "happens more than
+    /// once" flag to API consumers without forcing the frontend to
+    /// parse `event_data` itself.
+    #[serde(default)]
+    pub recurring: bool,
+    /// Mirrors `NomEvent.recurring_annual` — yearly cadence
+    /// specifically.
+    #[serde(default)]
+    pub recurring_annual: bool,
+    /// Mirrors `NomEvent.date_verified` — true when a human has
+    /// confirmed the current-instance dates are correct. The frontend
+    /// surfaces an "unverified date" badge when this is false.
+    #[serde(default)]
+    pub date_verified: bool,
+    /// Mirrors `NomEvent.archive` — true when an admin has archived
+    /// the event (or the auto-archive sweep retired a past one-time
+    /// event). Listing endpoints filter these out at the DB layer,
+    /// so a client receiving an archived event got it via direct
+    /// lookup (find_by_id / get_by_id_list) — typically from a saved
+    /// link. The frontend uses this to render an admin toggle and a
+    /// "this event has been archived" notice.
+    #[serde(default)]
+    pub archive: bool,
     //pub is_favorite: bool,
     //pub is_saved: bool,
 }
@@ -172,6 +195,10 @@ impl EventResponse {
             location_info: event.location_info,
             amenities: event.amenities,
             camping_info: event.camping_info,
+            recurring: event.recurring,
+            recurring_annual: event.recurring_annual,
+            date_verified: event.date_verified,
+            archive: event.archive,
             //is_favorite,
             //is_saved,
         })
@@ -349,4 +376,21 @@ pub struct UserCollection {
     pub saved_microevents: Option<Vec<i64>>,
     pub created_events: Option<Vec<i64>>,
     pub created_microevents: Option<Vec<i64>>,
+    /// Events explicitly added to the user's calendar/schedule via the
+    /// "Add to My Schedule" button on event detail. Distinct from
+    /// `saved_events` (which is a bookmark/library list) — a user can
+    /// save without scheduling and vice versa. Optional on the wire so
+    /// the frontend can omit it on legacy reads/writes; backend
+    /// defaults to `'[]'` per the migration.
+    #[serde(default)]
+    pub scheduled_events: Option<Vec<i64>>,
+    /// Microevents explicitly added to the user's schedule via the
+    /// schedule toggle on the microevent action buttons. Sister of
+    /// `scheduled_events` for microevents — a user can save/favorite a
+    /// microevent without committing it to their calendar and vice
+    /// versa. Optional on the wire so the frontend can omit it on
+    /// legacy reads/writes; backend defaults to `'[]'` per migration
+    /// 00006.
+    #[serde(default)]
+    pub scheduled_microevents: Option<Vec<i64>>,
 }

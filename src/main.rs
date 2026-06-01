@@ -10,7 +10,8 @@ use axum::{
     Json, Router, middleware,
     routing::{delete, get, post, put},
 };
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::str::FromStr;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::trace::TraceLayer;
@@ -82,10 +83,26 @@ async fn main() {
         tracing::info!("📁 Created events.db file");
     }
 
-    // Database setup
+    // Database setup. The connection options here matter:
+    //
+    // * `foreign_keys=ON` enables FK enforcement, which SQLite
+    //   defaults to OFF per-connection. Every `ON DELETE CASCADE` /
+    //   `ON DELETE RESTRICT` clause in our migrations is decorative
+    //   without this — historic deletes could orphan rows
+    //   (an `event_type` row vanishing left every event referencing
+    //   it pointing at a non-existent parent). The pragma applies
+    //   per connection, so it must be set in the options used to
+    //   build every pooled connection, not in a one-off
+    //   `sqlx::query("PRAGMA …")` after pool creation.
+    //
+    // * `mode=rwc` (read-write-create) preserves the prior behavior
+    //   of auto-creating `events.db` if missing.
+    let connect_options = SqliteConnectOptions::from_str("sqlite://events.db?mode=rwc")
+        .expect("Invalid SQLite connection URL")
+        .foreign_keys(true);
     let db = SqlitePoolOptions::new()
         .max_connections(5)
-        .connect("sqlite://events.db?mode=rwc")
+        .connect_with(connect_options)
         .await
         .expect("Failed to connect to database");
 
@@ -158,7 +175,11 @@ async fn main() {
     };
 
     let app_state = Arc::new(AppState {
-        event_logic: eventlogic,
+        // `event_logic` is cloned in (rather than moved) so the
+        // retention-sweep task below can hold its own `Arc` for the
+        // year-roll call without re-fetching from `app_state`. Same
+        // pattern as `jwt_revocation_logic` / `refresh_token_logic`.
+        event_logic: eventlogic.clone(),
         microevent_logic: microeventlogic,
         camping_profile_logic: campingprofilelogic,
         event_type_logic: eventtypelogic,
@@ -188,6 +209,12 @@ async fn main() {
     if sweep_interval_secs > 0 {
         let jwt_logic_for_sweep = jwtrevocationlogic.clone();
         let refresh_logic_for_sweep = refreshtokenlogic.clone();
+        let event_logic_for_sweep = eventlogic.clone();
+        // MicroeventContext doesn't have its own logic layer yet — the
+        // routes call straight into the context. For the auto-archive
+        // sweep we go through the context directly too. When a logic
+        // layer is added this clone moves up to that layer.
+        let microevent_ctx_for_sweep = microeventcontext.clone();
         tokio::spawn(async move {
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(sweep_interval_secs));
@@ -213,6 +240,41 @@ async fn main() {
                     Ok(_) => {}
                     Err(e) => {
                         tracing::warn!(error = ?e, "Refresh-token sweep failed; will retry");
+                    }
+                }
+                // Roll the year on recurring-annual events whose date
+                // has passed. Each rolled event gets `date_verified =
+                // false` so the UI can prompt the owner to confirm
+                // the new exact day.
+                match event_logic_for_sweep.roll_past_recurring_events().await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Year-roll sweep failed; will retry");
+                    }
+                }
+                // Auto-archive: one-time events past their end date.
+                // Sister of the roll-year sweep above — that one handles
+                // recurring events; this one retires the rest. Together
+                // they keep the catalog from accumulating stale rows.
+                match event_logic_for_sweep
+                    .auto_archive_past_non_recurring_events()
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Event auto-archive sweep failed; will retry");
+                    }
+                }
+                // Auto-archive past microevents. Microevents have no
+                // recurring concept — each one is tied to a specific
+                // calendar slot, so once `end_time < now` it's done.
+                match microevent_ctx_for_sweep.auto_archive_past().await {
+                    Ok(n) if n > 0 => {
+                        tracing::info!(rows = n, "Auto-archived past microevents")
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "Microevent auto-archive sweep failed; will retry");
                     }
                 }
             }
@@ -326,6 +388,18 @@ async fn main() {
             "/event/{id}",
             get(routes::events::get).put(routes::events::update),
         )
+        // Owner / admin marks the current-instance dates as verified.
+        // Auto-roll flips this to false on every year-bump; this
+        // route flips it back to true. Permission gate lives in
+        // `EventLogic::verify_event_date`.
+        .route("/event/{id}/verify-date", post(routes::events::verify_date))
+        // Admin-only archive flip — the logic layer rejects non-admin
+        // callers with 401, so no extra middleware is needed here.
+        // POST (not PUT/PATCH) because these are toggle endpoints with
+        // no body payload — same convention as the save/favorite
+        // toggles above.
+        .route("/event/{id}/archive", post(routes::events::archive))
+        .route("/event/{id}/unarchive", post(routes::events::unarchive))
         .route(
             "/event/{id}/microevent",
             get(routes::microevents::get_by_event), //.post(routes::microevents::create),
@@ -360,6 +434,20 @@ async fn main() {
             "/event/{id}/favorite",
             post(routes::usercollection::event_favorite_toggle),
         )
+        // Schedule toggle — distinct from save. Users add events to
+        // their calendar via this endpoint (driven by the "Add to My
+        // Schedule" button on event detail). Mirrors the save shape.
+        .route(
+            "/event/{id}/schedule-toggle",
+            post(routes::usercollection::event_schedule_toggle),
+        )
+        // Microevent schedule toggle — sister of the event toggle
+        // above. Same shape, different collection. Driven by the
+        // calendar button on MicroeventActionButtons.
+        .route(
+            "/microevent/{id}/schedule-toggle",
+            post(routes::usercollection::microevent_schedule_toggle),
+        )
         .route("/usercollection", get(routes::usercollection::get))
         .route("/usercollection/sync", post(routes::usercollection::sync))
         .route(
@@ -381,6 +469,14 @@ async fn main() {
         .route(
             "/user/saved/events",
             get(routes::usercollection::get_saved_events),
+        )
+        .route(
+            "/user/scheduled/events",
+            get(routes::usercollection::get_scheduled_events),
+        )
+        .route(
+            "/user/scheduled/microevents",
+            get(routes::usercollection::get_scheduled_microevents),
         )
         .route(
             "/user/saved/microevents",
@@ -456,6 +552,10 @@ async fn main() {
         .route("/admin/users/{id}/lock", post(routes::user::lock))
         .route("/admin/users/{id}/unlock", post(routes::user::unlock))
         .route("/admin/audit-log", get(routes::user::list_audit_log))
+        .route(
+            "/admin/analytics/summary",
+            get(routes::analytics::summary),
+        )
         .route("/event", get(routes::events::get_all))
         // Layer order (innermost → outermost / last-to-execute → first):
         //   require_admin → user_rate_limit → auth_middleware → handler

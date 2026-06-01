@@ -149,6 +149,56 @@ pub async fn delete(
     })))
 }
 
+/// `POST /event/{id}/verify-date` — the owner (or any Admin /
+/// SuperAdmin) confirms that the event's currently-stored
+/// `start_date` / `end_date` are correct for the current instance.
+/// Sets `event_data.date_verified = true`.
+///
+/// The auto-roll task in `main.rs` flips `date_verified` back to
+/// `false` every time it bumps the year on a recurring event, so the
+/// UI can surface an "unverified date — please confirm" badge until
+/// this endpoint (or a full `PUT /event/{id}`) is called.
+///
+/// Lives behind the JWT middleware (mounted in `main.rs` under
+/// `jwt_routes`) so `Extension<Claims>` is always present.
+pub async fn verify_date(
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<i64>,
+    State(service): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    service.event_logic.verify_event_date(id, claims).await?;
+    Ok(Json(json!({
+        "message": "Event date verified"
+    })))
+}
+
+/// Admin-only: archive an event (hide it from listings). Lives behind
+/// the JWT middleware; the logic layer enforces the admin role check
+/// and returns 401 for non-admin callers. The row stays in the DB so
+/// direct-link lookups still resolve and `unarchive` can restore it.
+pub async fn archive(
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<i64>,
+    State(service): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    service.event_logic.archive_event(id, claims).await?;
+    Ok(Json(json!({
+        "message": "Event archived"
+    })))
+}
+
+/// Admin-only: inverse of `archive`. Returns the event to active listings.
+pub async fn unarchive(
+    Extension(claims): Extension<Claims>,
+    Path(id): Path<i64>,
+    State(service): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    service.event_logic.unarchive_event(id, claims).await?;
+    Ok(Json(json!({
+        "message": "Event unarchived"
+    })))
+}
+
 //adding the favorite and saved sections
 //pub async fn save_toggle(
 //Extension(claims): Extension<Claims>,
@@ -227,7 +277,7 @@ mod tests {
         // returns rows when querying any event.
         sqlx::query(
             "INSERT INTO event_types (id, name, description, map_indicator, category) \
-             VALUES (1, 'Festival', 'A festival', 'F', 'entertainment')",
+             VALUES (1000, 'Festival', 'A festival', 'F', 'entertainment')",
         )
         .execute(&pool)
         .await
@@ -356,8 +406,8 @@ mod tests {
     #[tokio::test]
     async fn search_with_no_filters_returns_all_events() {
         let pool = setup_pool().await;
-        seed_event(&pool, "Alpha", 1, 33.0, -84.0).await;
-        seed_event(&pool, "Bravo", 1, 34.0, -85.0).await;
+        seed_event(&pool, "Alpha", 1000, 33.0, -84.0).await;
+        seed_event(&pool, "Bravo", 1000, 34.0, -85.0).await;
         let app = build_search_app(pool);
 
         let response = app
@@ -382,8 +432,8 @@ mod tests {
     #[tokio::test]
     async fn search_with_lat_lon_radius_filters_to_nearby() {
         let pool = setup_pool().await;
-        seed_event(&pool, "Atlanta", 1, 33.74, -84.39).await;
-        seed_event(&pool, "Seattle", 1, 47.61, -122.33).await;
+        seed_event(&pool, "Atlanta", 1000, 33.74, -84.39).await;
+        seed_event(&pool, "Seattle", 1000, 47.61, -122.33).await;
         let app = build_search_app(pool);
 
         // Query around Atlanta — Seattle should be filtered out.
@@ -410,22 +460,23 @@ mod tests {
     #[tokio::test]
     async fn search_with_event_type_only_returns_matching_type() {
         let pool = setup_pool().await;
-        // Seed a second event_type for filter distinction.
+        // Seed a second event_type (id 1001) for filter distinction.
+        // Primary seed id is 1000 (sits above the sentinel at id 1).
         sqlx::query(
             "INSERT INTO event_types (id, name, description, map_indicator, category) \
-             VALUES (2, 'Concert', 'A concert', 'C', 'entertainment')",
+             VALUES (1001, 'Concert', 'A concert', 'C', 'entertainment')",
         )
         .execute(&pool)
         .await
         .expect("seed second event_type");
-        seed_event(&pool, "Festival", 1, 33.0, -84.0).await;
-        seed_event(&pool, "Concert", 2, 34.0, -85.0).await;
+        seed_event(&pool, "Festival", 1000, 33.0, -84.0).await;
+        seed_event(&pool, "Concert", 1001, 34.0, -85.0).await;
         let app = build_search_app(pool);
 
         let response = app
             .oneshot(
                 Request::builder()
-                    .uri("/event/search?event_type=2")
+                    .uri("/event/search?event_type=1001")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -446,7 +497,7 @@ mod tests {
     async fn search_no_filters_respects_limit() {
         let pool = setup_pool().await;
         for i in 1..=5 {
-            seed_event(&pool, &format!("E{}", i), 1, 33.0 + i as f64, -84.0).await;
+            seed_event(&pool, &format!("E{}", i), 1000, 33.0 + i as f64, -84.0).await;
         }
         let app = build_search_app(pool);
 
@@ -498,7 +549,7 @@ mod tests {
         // `sort=garbage` should 400 from the logic-layer sort validator.
         // Pinned because a typo'd sort param should be loud, not silent.
         let pool = setup_pool().await;
-        seed_event(&pool, "X", 1, 33.0, -84.0).await;
+        seed_event(&pool, "X", 1000, 33.0, -84.0).await;
         let app = build_search_app(pool);
 
         let response = app
@@ -589,7 +640,7 @@ mod tests {
         let body = serde_json::json!({
             "name": "Test Event",
             "description": "Test description",
-            "event_type": { "id": 1, "name": "Festival", "description": "", "map_indicator": "F", "category": "entertainment" },
+            "event_type": { "id": 1000, "name": "Festival", "description": "", "map_indicator": "F", "category": "entertainment" },
             "date_info": {
                 "start_date": "2026-07-01T00:00:00Z",
                 "end_date": "2026-07-03T00:00:00Z",
@@ -637,7 +688,7 @@ mod tests {
         let body = serde_json::json!({
             "name": "Pinned Festival",
             "description": "Test event",
-            "event_type": { "id": 1, "name": "Festival", "description": "", "map_indicator": "F", "category": "entertainment" },
+            "event_type": { "id": 1000, "name": "Festival", "description": "", "map_indicator": "F", "category": "entertainment" },
             "date_info": {
                 "start_date": "2026-07-01T00:00:00Z",
                 "end_date": "2026-07-03T00:00:00Z",

@@ -12,6 +12,41 @@ use sqlx::SqlitePool;
 /// across SQLite versions and avoids accidentally building enormous queries.
 const MAX_BATCH_SIZE: usize = 500;
 
+/// Shared WHERE-clause fragment that hides past one-time events from
+/// listing endpoints. The rule: keep a row if any of these hold —
+///
+///   1. `recurring` is true or missing (default-true behavior). Annual /
+///      biennial / "happens again" events stay visible forever; the
+///      auto-roll-year task rolls annual recurring ones forward so users
+///      always see the next occurrence.
+///   2. The event has no start date yet (TBA). Stale TBA events are a
+///      data-quality problem to be solved with curator passes, not by
+///      hiding them from users who might have inside info on dates.
+///   3. The event hasn't ended yet (`end_date >= today`, falling back to
+///      `start_date` for single-day events without an explicit end).
+///
+/// The inverse (what gets filtered out) is precisely one-time events
+/// that have already happened — exactly the "no longer shown if it
+/// isn't recurring" UX the user wants. Detail-page lookups
+/// (`find_by_id`, `get_by_id_list`) deliberately do NOT apply this
+/// filter — saved-event links to past one-time events should still
+/// resolve so the frontend can show a "this event has ended" notice.
+const RECURRING_VISIBLE_FILTER: &str = "(\
+    COALESCE(json_extract(e.event_data, '$.recurring'), 1) != 0 \
+    OR e.start_date IS NULL \
+    OR substr(COALESCE(e.end_date, e.start_date), 1, 10) >= date('now')\
+)";
+
+/// Hide archived events from listing endpoints. The `archive` flag is
+/// stored inside the `event_data` JSON blob (not a top-level column).
+/// `COALESCE(..., 0)` treats a missing key as "not archived" so legacy
+/// rows from before the field existed continue to surface normally.
+/// Detail-page lookups (`find_by_id`, `get_by_id_list`) deliberately do
+/// NOT apply this filter — admins editing an archived event still need
+/// to load it, and saved-event links should resolve to a "this event
+/// has been archived" notice instead of a 404.
+const NOT_ARCHIVED_FILTER: &str = "COALESCE(json_extract(e.event_data, '$.archive'), 0) != 1";
+
 pub struct EventContext {
     pool: SqlitePool,
 }
@@ -28,7 +63,7 @@ impl EventContext {
     /// first — matches the admin-audit-log convention.
     pub async fn find_all(&self, limit: i64, offset: i64) -> Result<Vec<EventRow>, AppError> {
         let rows = sqlx::query_as::<_, EventRow>(
-            "SELECT
+            &format!("SELECT
                 e.id, e.name, e.description, e.website, e.event_type_id,
                 e.latitude, e.longitude, e.start_date, e.end_date, e.camping_allowed, e.event_data,
                 et.name as event_type_name,
@@ -37,8 +72,10 @@ impl EventContext {
                 et.category as event_type_category
              FROM events e
              JOIN event_types et ON e.event_type_id = et.id
+             WHERE {RECURRING_VISIBLE_FILTER}
+               AND {NOT_ARCHIVED_FILTER}
              ORDER BY e.id DESC
-             LIMIT ?1 OFFSET ?2",
+             LIMIT ?1 OFFSET ?2"),
         )
         .bind(limit)
         .bind(offset)
@@ -108,7 +145,7 @@ impl EventContext {
 
     pub async fn find_by_type(&self, event_type_id: i64) -> Result<Vec<EventRow>, AppError> {
         let rows = sqlx::query_as::<_, EventRow>(
-            "SELECT 
+            &format!("SELECT
                 e.id, e.name, e.description, e.website, e.event_type_id,
                 e.latitude, e.longitude, e.start_date, e.end_date, e.camping_allowed, e.event_data,
                 et.name as event_type_name,
@@ -117,7 +154,9 @@ impl EventContext {
                 et.category as event_type_category
              FROM events e
              JOIN event_types et ON e.event_type_id = et.id
-             WHERE e.event_type_id = ?",
+             WHERE e.event_type_id = ?
+               AND {RECURRING_VISIBLE_FILTER}
+               AND {NOT_ARCHIVED_FILTER}"),
         )
         .bind(event_type_id)
         .fetch_all(&self.pool)
@@ -159,8 +198,8 @@ impl EventContext {
         // combination of optional filters, but with three independent flags
         // (event_type, date_from, date_to) the cartesian gets to 2^3 = 8 arms.
         // Build-then-bind keeps the surface area small and obvious.
-        let mut sql = String::from(
-            r#"
+        let mut sql = format!(
+            "
         SELECT
             e.id, e.name, e.description, e.website, e.event_type_id,
             e.latitude, e.longitude, e.start_date, e.end_date, e.camping_allowed, e.event_data,
@@ -174,7 +213,9 @@ impl EventContext {
         AND e.longitude IS NOT NULL
         AND e.latitude BETWEEN ? AND ?
         AND e.longitude BETWEEN ? AND ?
-        "#,
+        AND {RECURRING_VISIBLE_FILTER}
+        AND {NOT_ARCHIVED_FILTER}
+        "
         );
 
         // Type filter. Empty vec = no filter; one element uses `= ?` (cleaner
@@ -376,6 +417,102 @@ impl EventContext {
 
         Ok(result.rows_affected() > 0)
     }
+
+    /// Find every event whose date has already passed AND whose
+    /// `event_data.recurring_annual` flag is set. Returned rows are
+    /// candidates for `EventLogic::roll_past_recurring_events`, which
+    /// bumps each row's start/end year by one and clears
+    /// `date_verified` so the UI can prompt the user to confirm.
+    ///
+    /// Date comparison uses `substr(date, 1, 10)` against `date('now')`
+    /// to dodge the documented format inconsistency in the date
+    /// columns (`YYYY-MM-DD` from the curator path vs
+    /// `YYYY-MM-DD HH:MM:SS UTC` from the chrono datetime path).
+    /// `COALESCE(end_date, start_date)` lets single-day events that
+    /// only filled the start date still match — and when both columns
+    /// are NULL the COALESCE returns NULL, substr-of-NULL is NULL,
+    /// and the row is correctly excluded.
+    /// Flip the `archive` flag inside the `event_data` JSON to `true`.
+    /// Returns true on a state change, false if the row was already in
+    /// the requested state (or doesn't exist). Mutates the JSON via
+    /// `json_set` so the rest of the blob — date_info, location_info,
+    /// recurring flags — is preserved untouched.
+    pub async fn archive(&self, id: i64) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "UPDATE events \
+             SET event_data = json_set(event_data, '$.archive', json('true')) \
+             WHERE id = ? AND COALESCE(json_extract(event_data, '$.archive'), 0) != 1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Inverse of `archive`. Returns true on a state change.
+    pub async fn unarchive(&self, id: i64) -> Result<bool, AppError> {
+        let result = sqlx::query(
+            "UPDATE events \
+             SET event_data = json_set(event_data, '$.archive', json('false')) \
+             WHERE id = ? AND COALESCE(json_extract(event_data, '$.archive'), 0) = 1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Sweep one-time events whose end date has passed and flip their
+    /// `archive` flag. Returns the number of rows archived.
+    ///
+    /// Mirror of `find_past_recurring` but for the opposite case: that
+    /// function finds recurring rows to roll forward, this one finds
+    /// non-recurring rows to retire. Together they keep the catalog
+    /// from accumulating stale rows.
+    ///
+    /// Predicate (all must hold):
+    ///   - `recurring = false` (an event with `recurring=true` or no
+    ///     flag is annual / biennial and shouldn't be auto-archived;
+    ///     the roll-year sweep handles annual ones, and biennial ones
+    ///     are still legitimately upcoming)
+    ///   - `archive != 1` (idempotent — re-running the sweep is a no-op)
+    ///   - end date (or start date when single-day) is strictly before
+    ///     today (we keep events that end today visible — they might
+    ///     still be in their final hours)
+    pub async fn auto_archive_past_non_recurring(&self) -> Result<u64, AppError> {
+        let result = sqlx::query(
+            "UPDATE events \
+             SET event_data = json_set(event_data, '$.archive', json('true')) \
+             WHERE json_extract(event_data, '$.recurring') = 0 \
+               AND COALESCE(json_extract(event_data, '$.archive'), 0) != 1 \
+               AND substr(COALESCE(end_date, start_date), 1, 10) < date('now')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn find_past_recurring(&self) -> Result<Vec<EventRow>, AppError> {
+        // Column order matches `EventRow` (sqlx::FromRow) — 11 native
+        // event columns followed by the 4 JOINed event_type columns.
+        let rows = sqlx::query_as::<_, EventRow>(
+            "SELECT e.id, e.name, e.description, e.website, e.event_type_id, \
+                    e.latitude, e.longitude, e.start_date, e.end_date, \
+                    e.camping_allowed, e.event_data, \
+                    et.name AS event_type_name, \
+                    et.description AS event_type_description, \
+                    et.map_indicator AS event_type_map_indicator, \
+                    et.category AS event_type_category \
+             FROM events e \
+             JOIN event_types et ON e.event_type_id = et.id \
+             WHERE substr(COALESCE(e.end_date, e.start_date), 1, 10) < date('now') \
+               AND json_extract(e.event_data, '$.recurring_annual') = 1",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
+        Ok(rows)
+    }
 }
 
 #[cfg(test)]
@@ -411,7 +548,7 @@ mod tests {
         // return no rows.
         sqlx::query(
             "INSERT INTO event_types (id, name, description, map_indicator, category) \
-             VALUES (1, 'Festival', 'A festival', 'F', 'entertainment')",
+             VALUES (1000, 'Festival', 'A festival', 'F', 'entertainment')",
         )
         .execute(&pool)
         .await
@@ -426,7 +563,7 @@ mod tests {
         serde_json::from_value(json!({
             "name": name,
             "description": format!("{} description", name),
-            "event_type_id": 1,
+            "event_type_id": 1000,
             "website": "https://example.test/event",
             "date_info": {
                 "start_date": "2026-06-15",
@@ -598,10 +735,13 @@ mod tests {
     #[tokio::test]
     async fn find_by_type_returns_only_matching() {
         let pool = setup_pool().await;
-        // Seed a second event_type so we can distinguish 1 from 2.
+        // Seed a second event_type so we can distinguish primary (1000)
+        // from secondary (1001). Primary id 1000 was chosen to sit
+        // well above the auto-seeded "Uncategorized" sentinel (id 1)
+        // introduced in migration 00007.
         sqlx::query(
             "INSERT INTO event_types (id, name, description, map_indicator, category) \
-             VALUES (2, 'Concert', 'A concert', 'C', 'entertainment')",
+             VALUES (1001, 'Concert', 'A concert', 'C', 'entertainment')",
         )
         .execute(&pool)
         .await
@@ -610,15 +750,15 @@ mod tests {
 
         let e1 = sample_event("Festival Event", 33.0, -84.0);
         let mut e2 = sample_event("Concert Event", 34.0, -85.0);
-        e2.event_type_id = 2;
+        e2.event_type_id = 1001;
         ctx.create(&e1).await.unwrap();
         ctx.create(&e2).await.unwrap();
 
-        let by_type_1 = ctx.find_by_type(1).await.expect("find_by_type 1");
+        let by_type_1 = ctx.find_by_type(1000).await.expect("find_by_type 1000");
         assert_eq!(by_type_1.len(), 1);
         assert_eq!(by_type_1[0].name, "Festival Event");
 
-        let by_type_2 = ctx.find_by_type(2).await.expect("find_by_type 2");
+        let by_type_2 = ctx.find_by_type(1001).await.expect("find_by_type 1001");
         assert_eq!(by_type_2.len(), 1);
         assert_eq!(by_type_2[0].name, "Concert Event");
     }
@@ -682,5 +822,304 @@ mod tests {
             }
             other => panic!("expected BadRequest, got {:?}", other),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Recurring-visibility filter — `find_all`, `find_by_type`,
+    // `find_nearby` must drop past one-time events but keep:
+    //   - past recurring events (they'll be auto-rolled forward, and in
+    //     the gap between "now" and the next roll they should still
+    //     appear)
+    //   - undated (TBA) events of any recurring flag (data-quality
+    //     placeholders, not stale finals)
+    //   - future events of any recurring flag
+    // -----------------------------------------------------------------
+
+    /// Build a NomEvent with explicit `recurring` flag and date range,
+    /// then insert via raw SQL to bypass the create()-level JSON shape
+    /// (so we can set start_date/end_date to historical values that the
+    /// stricter logic-layer validators would reject).
+    async fn insert_event_with_dates(
+        pool: &sqlx::SqlitePool,
+        name: &str,
+        start: Option<&str>,
+        end: Option<&str>,
+        recurring: bool,
+    ) -> i64 {
+        let event_data = json!({
+            "name": name,
+            "description": format!("{} description", name),
+            "event_type_id": 1000,
+            "recurring": recurring,
+            "date_info": {
+                "start_date": start.map(|s| format!("{}T00:00:00Z", s)),
+                "end_date": end.map(|s| format!("{}T00:00:00Z", s)),
+                "single_day": end.is_none() || start == end,
+            },
+            "location_info": {
+                "address": "Test Address",
+                "latitude": 40.0,
+                "longitude": -100.0,
+                "venue_name": "Test Venue",
+            },
+        });
+        let result = sqlx::query(
+            "INSERT INTO events (name, description, website, event_type_id, latitude, longitude, \
+             start_date, end_date, camping_allowed, event_data) \
+             VALUES (?, ?, NULL, 1000, 40.0, -100.0, ?, ?, 0, ?)",
+        )
+        .bind(name)
+        .bind("")
+        .bind(start.map(|s| format!("{} 00:00:00 UTC", s)))
+        .bind(end.map(|s| format!("{} 00:00:00 UTC", s)))
+        .bind(event_data.to_string())
+        .execute(pool)
+        .await
+        .expect("insert event with dates");
+        result.last_insert_rowid()
+    }
+
+    #[tokio::test]
+    async fn find_all_hides_past_non_recurring_events() {
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let past_one_time =
+            insert_event_with_dates(&pool, "Past OneTime", Some("2020-06-01"), Some("2020-06-03"), false).await;
+        let past_recurring =
+            insert_event_with_dates(&pool, "Past Recurring", Some("2020-07-01"), Some("2020-07-03"), true).await;
+        let future_one_time =
+            insert_event_with_dates(&pool, "Future OneTime", Some("2099-08-01"), Some("2099-08-03"), false).await;
+        let tba_one_time =
+            insert_event_with_dates(&pool, "TBA OneTime", None, None, false).await;
+
+        let all = ctx.find_all(100, 0).await.expect("find_all");
+        let ids: Vec<i64> = all.iter().map(|r| r.id).collect();
+
+        assert!(
+            !ids.contains(&past_one_time),
+            "past non-recurring event {} should be hidden",
+            past_one_time
+        );
+        assert!(
+            ids.contains(&past_recurring),
+            "past recurring event {} should still be visible (auto-roll will catch up)",
+            past_recurring
+        );
+        assert!(
+            ids.contains(&future_one_time),
+            "future non-recurring event {} should be visible",
+            future_one_time
+        );
+        assert!(
+            ids.contains(&tba_one_time),
+            "TBA non-recurring event {} should be visible (data-quality, not stale)",
+            tba_one_time
+        );
+    }
+
+    #[tokio::test]
+    async fn find_by_type_hides_past_non_recurring_events() {
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let past_one_time =
+            insert_event_with_dates(&pool, "Past Solo", Some("2020-06-01"), Some("2020-06-03"), false).await;
+        let future_one_time =
+            insert_event_with_dates(&pool, "Future Solo", Some("2099-08-01"), Some("2099-08-03"), false).await;
+
+        let rows = ctx.find_by_type(1000).await.expect("find_by_type");
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&past_one_time), "past non-recurring hidden");
+        assert!(ids.contains(&future_one_time), "future non-recurring visible");
+    }
+
+    #[tokio::test]
+    async fn find_nearby_hides_past_non_recurring_events() {
+        use crate::models::dto::EventSortOrder;
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let past_one_time =
+            insert_event_with_dates(&pool, "Past Local", Some("2020-06-01"), Some("2020-06-03"), false).await;
+        let future_one_time =
+            insert_event_with_dates(&pool, "Future Local", Some("2099-08-01"), Some("2099-08-03"), false).await;
+
+        // Center on (40, -100) — same as our inserts — with a wide
+        // radius so the bounding-box filter is non-restrictive.
+        let rows = ctx
+            .find_nearby(
+                40.0,
+                -100.0,
+                500.0,
+                vec![],
+                None,
+                None,
+                None,
+                None,
+                EventSortOrder::Name,
+                100,
+                0,
+            )
+            .await
+            .expect("find_nearby");
+        let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
+        assert!(!ids.contains(&past_one_time), "past non-recurring hidden");
+        assert!(ids.contains(&future_one_time), "future non-recurring visible");
+    }
+
+    // -----------------------------------------------------------------
+    // Archive: hand-flip + auto-archive sweep + listing filter
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn archive_flips_event_data_flag_and_hides_from_listings() {
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let id = ctx
+            .create(&sample_event("Active Festival", 33.0, -84.0))
+            .await
+            .expect("create");
+
+        // Sanity: visible before archive.
+        let visible = ctx.find_all(100, 0).await.expect("find_all pre");
+        assert!(visible.iter().any(|r| r.id == id));
+
+        let archived = ctx.archive(id).await.expect("archive");
+        assert!(archived, "first archive call should report state change");
+
+        // Idempotent: second call is a no-op.
+        let archived_again = ctx.archive(id).await.expect("archive again");
+        assert!(!archived_again, "re-archive should be a no-op");
+
+        // JSON blob updated.
+        let row = ctx.find_by_id(id).await.expect("find_by_id");
+        let payload: serde_json::Value =
+            serde_json::from_str(&row.event_data).expect("parse JSON");
+        assert_eq!(payload["archive"], serde_json::Value::Bool(true));
+
+        // Now hidden from listings.
+        let visible_after = ctx.find_all(100, 0).await.expect("find_all post");
+        assert!(
+            !visible_after.iter().any(|r| r.id == id),
+            "archived event should not appear in find_all"
+        );
+
+        // Detail lookup still works (saved links + admin restore path).
+        let direct = ctx.find_by_id(id).await.expect("find_by_id post-archive");
+        assert_eq!(direct.id, id);
+    }
+
+    #[tokio::test]
+    async fn unarchive_restores_visibility() {
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let id = ctx
+            .create(&sample_event("Toggle Festival", 33.0, -84.0))
+            .await
+            .expect("create");
+        ctx.archive(id).await.expect("archive");
+
+        let restored = ctx.unarchive(id).await.expect("unarchive");
+        assert!(restored, "first unarchive should report state change");
+        let restored_again = ctx.unarchive(id).await.expect("unarchive again");
+        assert!(!restored_again, "re-unarchive should be a no-op");
+
+        let visible = ctx.find_all(100, 0).await.expect("find_all");
+        assert!(visible.iter().any(|r| r.id == id));
+    }
+
+    #[tokio::test]
+    async fn auto_archive_past_non_recurring_targets_only_the_right_rows() {
+        // The sweep must archive past non-recurring events and leave
+        // recurring / future / TBA / already-archived rows alone.
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let past_one_time = insert_event_with_dates(
+            &pool,
+            "Past OneTime",
+            Some("2020-06-01"),
+            Some("2020-06-03"),
+            false,
+        )
+        .await;
+        let past_recurring = insert_event_with_dates(
+            &pool,
+            "Past Recurring",
+            Some("2020-07-01"),
+            Some("2020-07-03"),
+            true,
+        )
+        .await;
+        let future_one_time = insert_event_with_dates(
+            &pool,
+            "Future OneTime",
+            Some("2099-08-01"),
+            Some("2099-08-03"),
+            false,
+        )
+        .await;
+        let tba_one_time =
+            insert_event_with_dates(&pool, "TBA OneTime", None, None, false).await;
+
+        let archived_count = ctx
+            .auto_archive_past_non_recurring()
+            .await
+            .expect("auto-archive");
+        assert_eq!(
+            archived_count, 1,
+            "exactly the past-one-time row should be archived"
+        );
+
+        // Inline check rather than a closure — async closures can't
+        // capture &ctx through .await with stable Rust, and the move
+        // capture would consume ctx on first call.
+        async fn is_archived(ctx: &EventContext, id: i64) -> bool {
+            let row = ctx.find_by_id(id).await.expect("find_by_id");
+            let payload: serde_json::Value =
+                serde_json::from_str(&row.event_data).expect("parse JSON");
+            payload["archive"] == serde_json::Value::Bool(true)
+        }
+        assert!(
+            is_archived(&ctx, past_one_time).await,
+            "past one-time should be archived"
+        );
+        assert!(
+            !is_archived(&ctx, past_recurring).await,
+            "past recurring stays active — roll-year sweep will move it forward"
+        );
+        assert!(
+            !is_archived(&ctx, future_one_time).await,
+            "future one-time stays active"
+        );
+        assert!(
+            !is_archived(&ctx, tba_one_time).await,
+            "TBA one-time stays active until it has a date"
+        );
+
+        // Idempotent: second sweep is a no-op.
+        let second = ctx
+            .auto_archive_past_non_recurring()
+            .await
+            .expect("second sweep");
+        assert_eq!(second, 0, "re-sweep should be a no-op");
+    }
+
+    #[tokio::test]
+    async fn find_by_id_still_returns_past_non_recurring() {
+        // Detail lookups deliberately bypass the visibility filter so
+        // saved-event links to a one-time past event still resolve and
+        // the frontend can show a "this event has ended" notice.
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        let past_one_time =
+            insert_event_with_dates(&pool, "Past Direct", Some("2020-06-01"), Some("2020-06-03"), false).await;
+
+        let direct = ctx.find_by_id(past_one_time).await.expect("find_by_id");
+        assert_eq!(direct.id, past_one_time);
     }
 }

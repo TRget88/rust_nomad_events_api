@@ -131,6 +131,17 @@ pub struct UserEventDataRow {
     pub saved_microevents: Vec<i64>,
     pub created_events: Vec<i64>,
     pub created_microevents: Vec<i64>,
+    /// Events on the user's personal calendar/schedule. Distinct from
+    /// saved_events (bookmarks/library) — populated by the "Add to My
+    /// Schedule" button on event detail. Defaulted at the DB layer
+    /// (`'[]'` per migration 00005) so older rows still deserialize.
+    pub scheduled_events: Vec<i64>,
+    /// Microevents on the user's personal calendar/schedule. Sister of
+    /// `scheduled_events` — added so microevents have their own
+    /// deliberate scheduling decision rather than being inferred from
+    /// saved/favorited membership. Defaulted at the DB layer (`'[]'`
+    /// per migration 00006) so older rows still deserialize.
+    pub scheduled_microevents: Vec<i64>,
 }
 
 //####################################################################

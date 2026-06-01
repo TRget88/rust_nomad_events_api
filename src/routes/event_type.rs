@@ -299,6 +299,8 @@ mod tests {
 
     #[tokio::test]
     async fn list_returns_all_seeded_event_types() {
+        // Migration 00007 auto-seeds the "Uncategorized" sentinel into
+        // every test pool, so the expected length is `inserted + 1`.
         let pool = setup_pool().await;
         seed_event_type(&pool, "Festival", "entertainment").await;
         seed_event_type(&pool, "Concert", "entertainment").await;
@@ -317,19 +319,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let body = read_body_value(response).await;
         let arr = body.as_array().expect("list returns JSON array");
-        assert_eq!(arr.len(), 2);
+        assert_eq!(arr.len(), 3); // 2 inserted + 1 sentinel
         // Pin shape: every row must carry a non-empty name and category.
         for row in arr {
             assert!(!row["name"].as_str().unwrap().is_empty());
             assert!(!row["category"].as_str().unwrap().is_empty());
         }
+        let names: Vec<&str> = arr
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"Uncategorized"));
+        assert!(names.contains(&"Festival"));
+        assert!(names.contains(&"Concert"));
     }
 
     #[tokio::test]
-    async fn list_returns_empty_array_when_no_types() {
-        // Defensive: clients should see `[]`, not `null` or a 404. A
-        // future refactor that wrapped the empty list in `Option::None`
-        // would surface here.
+    async fn list_returns_only_sentinel_when_no_other_types() {
+        // Defensive: clients should see a JSON array, not `null` or a
+        // 404. With the sentinel auto-seed in 00007, the "empty" list
+        // is no longer truly empty — it always contains
+        // "Uncategorized". Pinned so a future refactor that hides the
+        // sentinel from this endpoint would surface here.
         let pool = setup_pool().await;
         let app = build_app(pool);
 
@@ -345,8 +356,9 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         let body = read_body_value(response).await;
-        assert!(body.is_array(), "empty list must still be a JSON array");
-        assert_eq!(body.as_array().unwrap().len(), 0);
+        let arr = body.as_array().expect("list returns JSON array");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["name"], "Uncategorized");
     }
 
     // -----------------------------------------------------------------

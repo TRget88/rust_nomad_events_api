@@ -28,3 +28,25 @@
 
 # Native SQLite CLI binary
 *.exe
+
+
+*.md
+*.txt
+
+# --- SQLite runtime sidecars & backups (cover the gaps that bare *.db misses) ---
+# WAL-mode sidecars are created at runtime and can hold uncommitted pages of
+# real data (user accounts included).
+*.db-wal
+*.db-shm
+
+# Full DB backups, e.g. events.db.bak-dedup-us-YYYYMMDD-HHMMSS — these are
+# complete copies of events.db (user accounts + catalog). Never commit them.
+*.bak
+*.db.bak*
+
+# Generated SQL dumps, e.g. rebuild/events_catalog.sql (a full catalog export).
+# Real migrations live under /migrations, which is already ignored above.
+*.sql
+
+# Scratch / debug helper scripts
+debug_script.sh

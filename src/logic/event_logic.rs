@@ -9,6 +9,7 @@ use crate::models::dto::{EventResponse, EventSortOrder};
 use crate::models::event_models::NomEvent;
 use crate::models::user::{Claims, UserRole};
 use crate::util::validate_pagination;
+use chrono::{DateTime, Datelike, Duration, Utc};
 use std::sync::Arc;
 
 pub struct EventLogic {
@@ -274,10 +275,174 @@ impl EventLogic {
         Ok(())
     }
 
+    /// Mark `date_verified = true` on an event. Gated to event owners
+    /// and Admin/SuperAdmin roles (same ownership shape as `update_event`
+    /// and `delete_event`). Re-reads the row, flips the flag, and writes
+    /// it back through the existing `update` path so the JSON column and
+    /// the denormalized columns stay in sync. Idempotent — verifying an
+    /// already-verified event is a no-op (and skips the write so the
+    /// `updated_at` trigger doesn't fire for nothing).
+    pub async fn verify_event_date(&self, id: i64, claims: Claims) -> Result<(), AppError> {
+        // Same gate as update_event / delete_event: admins bypass the
+        // ownership check; everyone else must own the event.
+        let is_admin = matches!(claims.role, UserRole::Admin | UserRole::SuperAdmin);
+        if !is_admin {
+            let collection = self.user_collection_logic.get(&claims.sub).await?;
+            if !collection.created_events.contains(&id) {
+                return Err(AppError::Unauthorized(
+                    "You do not have permission to verify this event's date".to_string(),
+                ));
+            }
+        }
+
+        let row = self.repository.find_by_id(id).await?;
+        let mut event: NomEvent = serde_json::from_str(&row.event_data)?;
+        if event.date_verified {
+            return Ok(());
+        }
+        event.date_verified = true;
+        self.repository.update(id, &event).await?;
+        Ok(())
+    }
+
+    /// Bump the year on every recurring-annual event whose date has
+    /// already passed. For each matching row:
+    ///
+    ///   * `start_date` += 1 year (preserving month/day; Feb 29 → Feb 28)
+    ///   * `end_date`   += 1 year (same rule)
+    ///   * `date_verified = false` (the bump is approximate — most
+    ///     festivals fall on a calendar weekend, not a calendar date,
+    ///     so the user has to confirm the new exact day)
+    ///
+    /// Returns the number of events rolled. Logs at `info!` when any
+    /// roll happens so ops can see the activity in the daily logs.
+    ///
+    /// Wired into the retention-sweep tokio task in `main.rs` so it
+    /// runs on the same cadence as the other recurring data tasks. A
+    /// future enhancement is to also create a verification reminder
+    /// for each rolled event so the user is nudged before it goes
+    /// public.
+    pub async fn roll_past_recurring_events(&self) -> Result<u64, AppError> {
+        let rows = self.repository.find_past_recurring().await?;
+        let mut rolled: u64 = 0;
+        for row in rows {
+            let event: NomEvent = match serde_json::from_str(&row.event_data) {
+                Ok(e) => e,
+                Err(err) => {
+                    // Corrupt JSON — log and skip, same shape as
+                    // `event_response_or_log` below. One bad row
+                    // shouldn't block the rest of the roll.
+                    tracing::warn!(
+                        event_id = row.id,
+                        error = %err,
+                        "Skipping event in roll_past_recurring_events — event_data JSON failed to parse"
+                    );
+                    continue;
+                }
+            };
+            let bumped = bump_event_year(event);
+            match self.repository.update(row.id, &bumped).await {
+                Ok(true) => rolled += 1,
+                Ok(false) => {
+                    // Race: the row was deleted between find and
+                    // update. Acceptable; just log and move on.
+                    tracing::warn!(
+                        event_id = row.id,
+                        "Row disappeared during roll_past_recurring_events"
+                    );
+                }
+                Err(err) => {
+                    // One failed update doesn't abort the whole sweep.
+                    // Log and continue so the remaining events still
+                    // get rolled.
+                    tracing::warn!(
+                        event_id = row.id,
+                        error = ?err,
+                        "Failed to roll event year"
+                    );
+                }
+            }
+        }
+        if rolled > 0 {
+            tracing::info!(rows = rolled, "Rolled past recurring events to next year");
+        }
+        Ok(rolled)
+    }
+
+    /// Admin-only: archive an event. Removes it from listing endpoints
+    /// (find_all / find_by_type / find_nearby) but keeps the row in the
+    /// DB so saved-event links resolve and unarchiving can restore it.
+    ///
+    /// Owner self-archive is intentionally NOT allowed in this iteration —
+    /// the field is reserved for catalog-curation decisions. A future
+    /// `hide_from_my_calendar` flag could give users per-account hiding
+    /// without affecting global visibility.
+    pub async fn archive_event(&self, id: i64, claims: Claims) -> Result<(), AppError> {
+        let is_admin = matches!(claims.role, UserRole::Admin | UserRole::SuperAdmin);
+        if !is_admin {
+            return Err(AppError::Unauthorized(
+                "Only admins can archive events".to_string(),
+            ));
+        }
+        self.repository.archive(id).await?;
+        Ok(())
+    }
+
+    /// Admin-only: inverse of `archive_event`.
+    pub async fn unarchive_event(&self, id: i64, claims: Claims) -> Result<(), AppError> {
+        let is_admin = matches!(claims.role, UserRole::Admin | UserRole::SuperAdmin);
+        if !is_admin {
+            return Err(AppError::Unauthorized(
+                "Only admins can unarchive events".to_string(),
+            ));
+        }
+        self.repository.unarchive(id).await?;
+        Ok(())
+    }
+
+    /// Sweep one-time events past their end date and archive them. Sister
+    /// of `roll_past_recurring_events` (which handles the recurring case);
+    /// together they keep stale rows out of the active catalog. Wired into
+    /// the retention sweep so it runs hourly by default.
+    pub async fn auto_archive_past_non_recurring_events(&self) -> Result<u64, AppError> {
+        let n = self.repository.auto_archive_past_non_recurring().await?;
+        if n > 0 {
+            tracing::info!(rows = n, "Auto-archived past non-recurring events");
+        }
+        Ok(n)
+    }
+
     // Private business logic methods
     fn validate_event(&self, event: &NomEvent) -> Result<(), AppError> {
         validate_event(event)
     }
+}
+
+/// Bump the year on both date fields by one and clear `date_verified`.
+/// Pure function (no DB I/O) so the year-arithmetic edge cases are
+/// pinnable by unit tests.
+///
+/// **Feb 29 handling:** `DateTime::with_year(year + 1)` returns `None`
+/// when the same month/day doesn't exist in the new year (i.e.
+/// 2024-02-29 → 2025-02-29 doesn't exist). The fallback subtracts a
+/// day to land on Feb 28, which is the conventional "next year" for
+/// a leap-day event. Festivals reschedule around leap years anyway,
+/// and the `date_verified = false` flag prompts the user to confirm.
+pub(crate) fn bump_event_year(mut event: NomEvent) -> NomEvent {
+    event.date_info.start_date = event.date_info.start_date.map(bump_year);
+    event.date_info.end_date = event.date_info.end_date.map(bump_year);
+    event.date_verified = false;
+    event
+}
+
+fn bump_year(dt: DateTime<Utc>) -> DateTime<Utc> {
+    dt.with_year(dt.year() + 1).unwrap_or_else(|| {
+        // Feb 29 path: subtract a day, then bump — Feb 28 always
+        // exists in the next year.
+        (dt - Duration::days(1))
+            .with_year(dt.year() + 1)
+            .unwrap_or(dt) // shouldn't happen; preserve original on impossible path
+    })
 }
 
 /// Convert an `EventRow` to `EventResponse`, logging and dropping rows
@@ -560,6 +725,12 @@ mod tests {
             amenities: None,
             camping_info: None,
             archive: false,
+            // Default the recurrence markers + date_verified off for
+            // the test fixture. Tests that need them on flip per-test
+            // via field-mutation before invoking the validator.
+            recurring: false,
+            recurring_annual: false,
+            date_verified: false,
         }
     }
 
@@ -873,5 +1044,79 @@ mod tests {
             .join(",");
         let err = validate_event_type_ids(None, Some(&csv)).unwrap_err();
         assert!(matches!(err, AppError::ValidationError(_)));
+    }
+
+    // -------------------------------------------------------------
+    // bump_event_year — pure year-arithmetic on the date_info dates
+    // -------------------------------------------------------------
+    //
+    // The bump is approximate (festivals usually fall on a weekend,
+    // not a fixed calendar date), so `date_verified` is always
+    // cleared. The pure-function shape lets us exercise the leap-day
+    // edge case without spinning up a DB.
+
+    use chrono::TimeZone;
+
+    fn dt(year: i32, month: u32, day: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(year, month, day, 0, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn bump_event_year_advances_both_dates_by_one_year() {
+        let mut event = make_event("Annual Fest", "desc");
+        event.date_info.start_date = Some(dt(2026, 7, 4));
+        event.date_info.end_date = Some(dt(2026, 7, 6));
+        event.recurring_annual = true;
+        event.date_verified = true;
+
+        let bumped = bump_event_year(event);
+        assert_eq!(bumped.date_info.start_date, Some(dt(2027, 7, 4)));
+        assert_eq!(bumped.date_info.end_date, Some(dt(2027, 7, 6)));
+        // Auto-roll always clears verification — the new date is a
+        // guess and the owner must reconfirm.
+        assert!(!bumped.date_verified);
+    }
+
+    #[test]
+    fn bump_event_year_leap_day_falls_back_to_feb_28() {
+        // 2024-02-29 → 2025-02-29 doesn't exist; conventional
+        // behavior is to land on Feb 28 of the new year.
+        let mut event = make_event("Leap Day Fest", "desc");
+        event.date_info.start_date = Some(dt(2024, 2, 29));
+        event.date_info.end_date = Some(dt(2024, 2, 29));
+
+        let bumped = bump_event_year(event);
+        assert_eq!(bumped.date_info.start_date, Some(dt(2025, 2, 28)));
+        assert_eq!(bumped.date_info.end_date, Some(dt(2025, 2, 28)));
+    }
+
+    #[test]
+    fn bump_event_year_preserves_null_dates() {
+        // Some seasonal events have NULL start/end_date (the
+        // Renaissance Faire cluster, etc.). The bump should leave
+        // them alone — there's nothing to advance — and still flip
+        // date_verified off so the owner is prompted to fill them in.
+        let mut event = make_event("No-Date Fest", "desc");
+        event.date_info.start_date = None;
+        event.date_info.end_date = None;
+        event.date_verified = true;
+
+        let bumped = bump_event_year(event);
+        assert!(bumped.date_info.start_date.is_none());
+        assert!(bumped.date_info.end_date.is_none());
+        assert!(!bumped.date_verified);
+    }
+
+    #[test]
+    fn bump_event_year_handles_start_without_end() {
+        // Single-day events: start_date set, end_date null. The bump
+        // should advance start and leave end null.
+        let mut event = make_event("One Day Fest", "desc");
+        event.date_info.start_date = Some(dt(2025, 11, 15));
+        event.date_info.end_date = None;
+
+        let bumped = bump_event_year(event);
+        assert_eq!(bumped.date_info.start_date, Some(dt(2026, 11, 15)));
+        assert!(bumped.date_info.end_date.is_none());
     }
 }

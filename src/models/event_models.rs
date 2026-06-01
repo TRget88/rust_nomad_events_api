@@ -23,6 +23,30 @@ pub struct NomEvent {
     pub camping_info: Option<CampingInfo>,
     #[serde(default)]
     pub archive: bool,
+    /// True if the event runs more than once on any cadence (weekly
+    /// farmers market, monthly meetup, annual festival, etc.). Broader
+    /// than `recurring_annual`. Defaults to false on legacy rows whose
+    /// JSON predates this field — pair with the bulk DB backfill that
+    /// set `recurring = true` for everything where `recurring_annual`
+    /// is also true.
+    #[serde(default)]
+    pub recurring: bool,
+    /// True if the event recurs once per year (most festivals fall
+    /// here). Tighter than `recurring`: a weekly market is `recurring`
+    /// but not `recurring_annual`. Defaults to false; existing JSON
+    /// without the field deserializes cleanly via `#[serde(default)]`.
+    #[serde(default)]
+    pub recurring_annual: bool,
+    /// Has a human confirmed that `date_info.start_date` and
+    /// `end_date` are correct for the *current* instance of this
+    /// recurring event? Auto-roll (see `EventLogic::roll_past_recurring_events`)
+    /// flips this back to `false` every time it bumps the year, so the
+    /// UI can surface an "unverified date — please confirm" badge.
+    /// User-side `POST /event/{id}/verify-date` and any successful
+    /// `PUT /event/{id}` that touches dates flip it to `true`.
+    /// Defaults to false on legacy rows that predate this field.
+    #[serde(default)]
+    pub date_verified: bool,
 }
 
 fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
@@ -335,5 +359,123 @@ where
             ..Default::default()
         })),
         Some(GeneratorValue::Object(options)) => Ok(Some(options)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for the recurrence-marker contract on `NomEvent`. The
+    //! markers are written into `event_data` JSON in the DB; if the
+    //! struct ever loses them they'll be silently dropped on the next
+    //! API read/write round-trip. These tests catch that regression.
+    //!
+    //! Date / location / camping deserialization is covered separately.
+    //! Here we only pin the new boolean fields and their `#[serde(default)]`
+    //! behavior against legacy JSON.
+    use super::*;
+
+    /// Legacy JSON shape that predates the recurrence markers — same
+    /// `event_data` text every pre-curation row in the DB carries. The
+    /// `#[serde(default)]` on both fields must let this deserialize
+    /// cleanly with both bools defaulted to `false`.
+    const LEGACY_JSON: &str = r#"{
+        "id": 1,
+        "user_id": null,
+        "name": "Legacy Event",
+        "description": "No recurring markers in the JSON",
+        "event_type_id": 1,
+        "website": null,
+        "date_info": {
+            "start_date": null,
+            "end_date": null,
+            "single_day": false,
+            "early_arrival_available": false,
+            "early_arrival_date": null,
+            "late_departure_available": false
+        },
+        "location_info": {
+            "address": "Atlanta, GA",
+            "longitude": -84.39,
+            "latitude": 33.74,
+            "venue_name": null,
+            "parking_info": null
+        },
+        "amenities": null,
+        "camping_info": null,
+        "archive": false
+    }"#;
+
+    #[test]
+    fn legacy_json_without_recurrence_markers_defaults_to_false() {
+        let event: NomEvent =
+            serde_json::from_str(LEGACY_JSON).expect("legacy JSON must deserialize");
+        assert!(!event.recurring);
+        assert!(!event.recurring_annual);
+    }
+
+    #[test]
+    fn recurrence_markers_round_trip_through_json() {
+        // Serialize an event with both markers on, deserialize it, and
+        // confirm both flags survived. Catches a regression where the
+        // serde derive forgot to include the field or accidentally
+        // renamed the JSON key.
+        let event = NomEvent {
+            id: None,
+            user_id: None,
+            name: "Roundtripper".to_string(),
+            description: "Tests serde".to_string(),
+            event_type_id: 1,
+            website: None,
+            date_info: EventDate::default(),
+            location_info: Location::default(),
+            amenities: None,
+            camping_info: None,
+            archive: false,
+            recurring: true,
+            recurring_annual: true,
+            // Default false so the round-trip pins the default-on-
+            // serialize path. Verification-state coverage lives in
+            // its own test below.
+            date_verified: false,
+        };
+
+        let raw = serde_json::to_string(&event).expect("serialize");
+        // Pin the JSON key names — a future refactor that renamed
+        // either field would change these strings, and the DB
+        // backfill (which writes raw `recurring` and
+        // `recurring_annual` keys via SQLite's `json_set`) would
+        // silently stop matching.
+        assert!(raw.contains("\"recurring\":true"));
+        assert!(raw.contains("\"recurring_annual\":true"));
+
+        let parsed: NomEvent = serde_json::from_str(&raw).expect("deserialize");
+        assert!(parsed.recurring);
+        assert!(parsed.recurring_annual);
+    }
+
+    #[test]
+    fn recurring_independent_of_recurring_annual() {
+        // A weekly farmers market is `recurring` but not
+        // `recurring_annual`. Pin that the two flags decode independently
+        // — a regression that collapsed them into one field would
+        // surface here.
+        let json = r#"{
+            "id": 2,
+            "name": "Saturday Market",
+            "description": "Every Saturday",
+            "event_type_id": 1,
+            "date_info": { "start_date": null, "end_date": null,
+                "single_day": false, "early_arrival_available": false,
+                "early_arrival_date": null, "late_departure_available": false },
+            "location_info": { "address": "Town Square",
+                "longitude": 0.0, "latitude": 0.0,
+                "venue_name": null, "parking_info": null },
+            "archive": false,
+            "recurring": true,
+            "recurring_annual": false
+        }"#;
+        let event: NomEvent = serde_json::from_str(json).expect("deserialize");
+        assert!(event.recurring);
+        assert!(!event.recurring_annual);
     }
 }

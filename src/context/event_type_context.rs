@@ -157,6 +157,41 @@ mod tests {
         pool
     }
 
+    /// Pool with `foreign_keys=ON` so the BEFORE DELETE triggers added
+    /// in migration 00007 (reparent + sentinel protection) fire under
+    /// the same FK regime as production. Use this for trigger tests
+    /// only — the rest of the tests don't need FK enforcement.
+    async fn setup_pool_with_fk() -> sqlx::SqlitePool {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use std::str::FromStr;
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .expect("parse url")
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .expect("connect in-memory sqlite with FK");
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .expect("run migrations");
+        pool
+    }
+
+    /// Look up the sentinel id once per test rather than hardcoding.
+    /// The sentinel is inserted by migration 00007 via INSERT OR
+    /// IGNORE, so its rowid depends on insert order vs the seed
+    /// types — never assume a particular value.
+    async fn sentinel_id(pool: &sqlx::SqlitePool) -> i64 {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM event_types WHERE name = 'Uncategorized'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("sentinel exists")
+    }
+
     fn sample_event_type(name: &str, category: &str) -> EventType {
         EventType {
             id: None,
@@ -266,7 +301,9 @@ mod tests {
     async fn find_all_returns_every_row() {
         // event_types are catalog data — the table is small and unsorted
         // by the query. Pin that find_all returns every row, regardless
-        // of order.
+        // of order. Migration 00007 seeds the "Uncategorized" sentinel
+        // unconditionally, so the count includes it (3 inserted + 1
+        // sentinel = 4 total).
         let pool = setup_pool().await;
         let ctx = EventTypeContext::new(pool);
 
@@ -284,11 +321,14 @@ mod tests {
             .unwrap();
 
         let all = ctx.find_all().await.expect("find_all");
-        assert_eq!(all.len(), 3);
+        assert_eq!(all.len(), 4);
         let ids: Vec<i64> = all.iter().filter_map(|t| t.id).collect();
         assert!(ids.contains(&id1));
         assert!(ids.contains(&id2));
         assert!(ids.contains(&id3));
+        // Pin: sentinel is present and discoverable by name.
+        let names: Vec<_> = all.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"Uncategorized"));
     }
 
     // -----------------------------------------------------------------
@@ -367,5 +407,127 @@ mod tests {
             .await
             .expect("find");
         assert_eq!(no_matches.len(), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // Migration 00007 — sentinel + reparenting trigger
+    //
+    // These tests run with `foreign_keys=ON` so the production FK
+    // regime is exercised. They pin:
+    //   1. The sentinel ("Uncategorized") exists after migrations run
+    //   2. Deleting a non-sentinel event_type reparents its events to
+    //      the sentinel rather than failing the ON DELETE RESTRICT
+    //      check or orphaning rows
+    //   3. The sentinel itself cannot be deleted — the trigger
+    //      aborts with the documented message
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn sentinel_exists_after_migration() {
+        let pool = setup_pool_with_fk().await;
+        let sid = sentinel_id(&pool).await;
+        assert!(sid > 0);
+
+        // Pin metadata so the seed shape doesn't silently drift.
+        let row = sqlx::query_as::<_, EventTypeRow>(
+            "SELECT id, name, description, map_indicator, category FROM event_types WHERE id = ?",
+        )
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .expect("fetch sentinel");
+        assert_eq!(row.name, "Uncategorized");
+        assert_eq!(row.category, "general");
+    }
+
+    #[tokio::test]
+    async fn deleting_event_type_reparents_dependent_events_to_sentinel() {
+        // The scenario: an admin deletes the "Music Festival" type
+        // while two events still reference it. Pre-trigger, the
+        // ON DELETE RESTRICT FK would block the DELETE; post-trigger,
+        // the events re-parent to the sentinel and the DELETE
+        // succeeds.
+        let pool = setup_pool_with_fk().await;
+        let ctx = EventTypeContext::new(pool.clone());
+        let sid = sentinel_id(&pool).await;
+
+        let music_id = ctx
+            .create(&sample_event_type("Music Festival", "entertainment"))
+            .await
+            .expect("create music");
+
+        // Insert two events referencing the "Music Festival" type
+        // directly through the raw pool — we don't have an event
+        // context here, but the schema only needs the FK + the
+        // non-nullable columns.
+        for n in 1..=2 {
+            sqlx::query(
+                "INSERT INTO events (name, description, event_type_id, event_data) \
+                 VALUES (?, ?, ?, '{}')",
+            )
+            .bind(format!("Event {}", n))
+            .bind("desc")
+            .bind(music_id)
+            .execute(&pool)
+            .await
+            .expect("insert event");
+        }
+
+        // Sanity: both events currently point at Music.
+        let before: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type_id = ?",
+        )
+        .bind(music_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count before");
+        assert_eq!(before, 2);
+
+        // Delete the Music type — should succeed because the
+        // BEFORE DELETE trigger reparents both events first.
+        let deleted = ctx.delete(music_id).await.expect("delete music");
+        assert!(deleted);
+
+        // Music gone, sentinel now owns both events.
+        let after_music: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type_id = ?",
+        )
+        .bind(music_id)
+        .fetch_one(&pool)
+        .await
+        .expect("count after");
+        assert_eq!(after_music, 0);
+
+        let after_sentinel: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE event_type_id = ?",
+        )
+        .bind(sid)
+        .fetch_one(&pool)
+        .await
+        .expect("count sentinel");
+        assert_eq!(after_sentinel, 2);
+    }
+
+    #[tokio::test]
+    async fn deleting_sentinel_event_type_is_forbidden() {
+        // The protective trigger aborts the DELETE with a RAISE.
+        // Pin: the sentinel still exists afterward, and the error
+        // surfaces (we don't care about the exact message — only
+        // that it failed).
+        let pool = setup_pool_with_fk().await;
+        let ctx = EventTypeContext::new(pool.clone());
+        let sid = sentinel_id(&pool).await;
+
+        let result = ctx.delete(sid).await;
+        assert!(result.is_err(), "deleting the sentinel must fail");
+
+        // Sentinel still there.
+        let still_there: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_types WHERE name = 'Uncategorized'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count sentinel");
+        assert_eq!(still_there, 1);
     }
 }

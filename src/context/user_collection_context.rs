@@ -26,7 +26,9 @@ impl UserCollectionContext {
             saved_events,
             saved_microevents,
             created_events,
-            created_microevents
+            created_microevents,
+            scheduled_events,
+            scheduled_microevents
         FROM user_event_data
         WHERE user_id = ?
         "#,
@@ -74,6 +76,18 @@ impl UserCollectionContext {
                         .as_deref()
                         .unwrap_or("[]"),
                 )?,
+
+                scheduled_events: serde_json::from_str::<Vec<i64>>(
+                    row.get::<Option<String>, _>("scheduled_events")
+                        .as_deref()
+                        .unwrap_or("[]"),
+                )?,
+
+                scheduled_microevents: serde_json::from_str::<Vec<i64>>(
+                    row.get::<Option<String>, _>("scheduled_microevents")
+                        .as_deref()
+                        .unwrap_or("[]"),
+                )?,
             });
         }
 
@@ -90,6 +104,8 @@ impl UserCollectionContext {
             saved_microevents: vec![],
             created_events: vec![],
             created_microevents: vec![],
+            scheduled_events: vec![],
+            scheduled_microevents: vec![],
         };
 
         self.create(&empty).await?;
@@ -109,7 +125,9 @@ impl UserCollectionContext {
             saved_events,
             saved_microevents,
             created_events,
-            created_microevents
+            created_microevents,
+            scheduled_events,
+            scheduled_microevents
         FROM user_event_data
         WHERE id = ?
         "#,
@@ -157,6 +175,18 @@ impl UserCollectionContext {
                         .as_deref()
                         .unwrap_or("[]"),
                 )?,
+
+                scheduled_events: serde_json::from_str::<Vec<i64>>(
+                    row.get::<Option<String>, _>("scheduled_events")
+                        .as_deref()
+                        .unwrap_or("[]"),
+                )?,
+
+                scheduled_microevents: serde_json::from_str::<Vec<i64>>(
+                    row.get::<Option<String>, _>("scheduled_microevents")
+                        .as_deref()
+                        .unwrap_or("[]"),
+                )?,
             });
         }
         Err(AppError::NotFound("User event data not found".to_string()))
@@ -189,13 +219,16 @@ impl UserCollectionContext {
         let saved_microevents = serde_json::to_string(&data.saved_microevents)?;
         let created_events = serde_json::to_string(&data.created_events)?;
         let created_microevents = serde_json::to_string(&data.created_microevents)?;
+        let scheduled_events = serde_json::to_string(&data.scheduled_events)?;
+        let scheduled_microevents = serde_json::to_string(&data.scheduled_microevents)?;
 
         sqlx::query(
             r#"
-            INSERT INTO user_event_data 
-            (user_id, favorite_events, favorite_microevents, saved_events, 
-             saved_microevents, created_events, created_microevents)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO user_event_data
+            (user_id, favorite_events, favorite_microevents, saved_events,
+             saved_microevents, created_events, created_microevents,
+             scheduled_events, scheduled_microevents)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&data.user_id)
@@ -205,6 +238,8 @@ impl UserCollectionContext {
         .bind(&saved_microevents)
         .bind(&created_events)
         .bind(&created_microevents)
+        .bind(&scheduled_events)
+        .bind(&scheduled_microevents)
         .execute(&self.pool)
         .await?;
 
@@ -218,6 +253,8 @@ impl UserCollectionContext {
         let saved_microevents = serde_json::to_string(&data.saved_microevents)?;
         let created_events = serde_json::to_string(&data.created_events)?;
         let created_microevents = serde_json::to_string(&data.created_microevents)?;
+        let scheduled_events = serde_json::to_string(&data.scheduled_events)?;
+        let scheduled_microevents = serde_json::to_string(&data.scheduled_microevents)?;
 
         sqlx::query(
             r#"
@@ -227,7 +264,9 @@ impl UserCollectionContext {
                 saved_events = ?,
                 saved_microevents = ?,
                 created_events = ?,
-                created_microevents = ?
+                created_microevents = ?,
+                scheduled_events = ?,
+                scheduled_microevents = ?
             WHERE user_id = ?
             "#,
         )
@@ -237,6 +276,8 @@ impl UserCollectionContext {
         .bind(&saved_microevents)
         .bind(&created_events)
         .bind(&created_microevents)
+        .bind(&scheduled_events)
+        .bind(&scheduled_microevents)
         .bind(&data.user_id)
         .execute(&self.pool)
         .await?;
@@ -294,6 +335,8 @@ mod tests {
         assert_eq!(row.saved_microevents, Vec::<i64>::new());
         assert_eq!(row.created_events, Vec::<i64>::new());
         assert_eq!(row.created_microevents, Vec::<i64>::new());
+        assert_eq!(row.scheduled_events, Vec::<i64>::new());
+        assert_eq!(row.scheduled_microevents, Vec::<i64>::new());
 
         // Second call must not re-auto-create — it should find the
         // row already there. Pinned via a subsequent count.
@@ -307,9 +350,11 @@ mod tests {
 
     #[tokio::test]
     async fn update_persists_arrays_and_get_round_trips() {
-        // The context serializes the six `Vec<i64>` arrays into JSON
-        // text columns. Pin the round-trip — every array shape needs
-        // to survive serialize → SQLite → deserialize.
+        // The context serializes the `Vec<i64>` arrays into JSON text
+        // columns. Pin the round-trip — every array shape needs to
+        // survive serialize → SQLite → deserialize. Includes the
+        // scheduled_events / scheduled_microevents columns added in
+        // migrations 00005 / 00006.
         let pool = setup_pool().await;
         let ctx = UserCollectionContext::new(pool);
 
@@ -321,6 +366,8 @@ mod tests {
         row.saved_microevents = vec![];
         row.created_events = vec![6, 7, 8, 9];
         row.created_microevents = vec![100, 101];
+        row.scheduled_events = vec![42];
+        row.scheduled_microevents = vec![200, 201];
         ctx.update(&row).await.expect("update");
 
         // Round-trip via a fresh get.
@@ -331,6 +378,8 @@ mod tests {
         assert_eq!(reloaded.saved_microevents, Vec::<i64>::new());
         assert_eq!(reloaded.created_events, vec![6, 7, 8, 9]);
         assert_eq!(reloaded.created_microevents, vec![100, 101]);
+        assert_eq!(reloaded.scheduled_events, vec![42]);
+        assert_eq!(reloaded.scheduled_microevents, vec![200, 201]);
     }
 
     #[tokio::test]

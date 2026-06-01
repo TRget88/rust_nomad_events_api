@@ -1,4 +1,5 @@
 // src/routes/mod.rs
+pub mod analytics;
 pub mod auth;
 pub mod camping_profiles;
 pub mod event_type;

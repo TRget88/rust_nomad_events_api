@@ -65,6 +65,8 @@ impl UserCollectionLogic {
             saved_microevents: input.saved_microevents.unwrap_or_default(),
             created_events: input.created_events.unwrap_or_default(),
             created_microevents: input.created_microevents.unwrap_or_default(),
+            scheduled_events: input.scheduled_events.unwrap_or_default(),
+            scheduled_microevents: input.scheduled_microevents.unwrap_or_default(),
         };
 
         self.repository.update(&row).await?;
@@ -115,6 +117,17 @@ impl UserCollectionLogic {
             saved_microevents: input.saved_microevents.unwrap_or_default(),
             created_events: ogrow.created_events,
             created_microevents: ogrow.created_microevents,
+            // scheduled_events is owner-write-only: callers updating via
+            // this path can rotate the schedule list. If they don't
+            // send it we keep the existing server-side value.
+            scheduled_events: input.scheduled_events.unwrap_or(ogrow.scheduled_events),
+            // Same pattern as scheduled_events — preserve the existing
+            // server-side value when the caller doesn't supply one, so
+            // legacy clients can sync the rest of the collection
+            // without zeroing out their microevent schedule.
+            scheduled_microevents: input
+                .scheduled_microevents
+                .unwrap_or(ogrow.scheduled_microevents),
         };
 
         self.repository.update(&row).await?;
@@ -343,5 +356,78 @@ impl UserCollectionLogic {
             .await?;
 
         Ok(output)
+    }
+
+    /// Return hydrated EventResponse rows for every event on the
+    /// user's personal schedule. Mirrors `get_saved_events` but reads
+    /// the `scheduled_events` id-list. This is the backing for the
+    /// /schedule UI's calendar grid.
+    pub async fn get_scheduled_events(
+        &self,
+        user_id: &String,
+    ) -> Result<Vec<EventResponse>, AppError> {
+        let preoutput = self.repository.get(user_id.to_string()).await?;
+        let rows = self
+            .events_context
+            .get_by_id_list(preoutput.scheduled_events)
+            .await?;
+        let output: Vec<EventResponse> =
+            rows.into_iter().filter_map(event_response_or_log).collect();
+        Ok(output)
+    }
+
+    /// Toggle an event's presence on the user's schedule. Returns the
+    /// updated `scheduled_events` id list. Mirror of
+    /// `event_save_toggle` — same shape, same RFC-9700 semantics, just
+    /// hits a different column.
+    pub async fn event_schedule_toggle(
+        &self,
+        id: i64,
+        user_id: &String,
+    ) -> Result<Vec<i64>, AppError> {
+        let mut data = self.repository.get(user_id.to_string()).await?;
+
+        if let Some(pos) = data.scheduled_events.iter().position(|x| *x == id) {
+            data.scheduled_events.remove(pos);
+        } else {
+            data.scheduled_events.push(id);
+        }
+        self.repository.update(&data).await?;
+        Ok(data.scheduled_events)
+    }
+
+    /// Return hydrated Microevent rows for every microevent on the
+    /// user's personal schedule. Mirrors `get_saved_microevents` but
+    /// reads `scheduled_microevents`. This is the backing for the
+    /// /schedule UI's calendar grid (microevent half).
+    pub async fn get_scheduled_microevents(
+        &self,
+        user_id: &String,
+    ) -> Result<Vec<Microevent>, AppError> {
+        let preoutput = self.repository.get(user_id.to_string()).await?;
+        let output = self
+            .microevents_context
+            .get_by_id_list(preoutput.scheduled_microevents)
+            .await?;
+        Ok(output)
+    }
+
+    /// Toggle a microevent's presence on the user's schedule. Returns
+    /// the updated `scheduled_microevents` id list. Mirror of
+    /// `event_schedule_toggle` — same shape, different column.
+    pub async fn microevent_schedule_toggle(
+        &self,
+        id: i64,
+        user_id: &String,
+    ) -> Result<Vec<i64>, AppError> {
+        let mut data = self.repository.get(user_id.to_string()).await?;
+
+        if let Some(pos) = data.scheduled_microevents.iter().position(|x| *x == id) {
+            data.scheduled_microevents.remove(pos);
+        } else {
+            data.scheduled_microevents.push(id);
+        }
+        self.repository.update(&data).await?;
+        Ok(data.scheduled_microevents)
     }
 }

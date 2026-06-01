@@ -188,6 +188,30 @@ impl MicroeventContext {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Sweep microevents whose end time has passed and flip their
+    /// `archive` flag. Microevents have no `recurring` concept — each
+    /// one is tied to a specific occurrence of a parent event, so once
+    /// `end_time < now` it's done and should disappear from the active
+    /// list. Returns the number of rows archived.
+    ///
+    /// Idempotent: re-running the sweep does nothing for already-archived
+    /// rows. Microevents with NULL end_time are skipped — TBA microevents
+    /// stay visible until their owner fills the time in.
+    pub async fn auto_archive_past(&self) -> Result<u64, AppError> {
+        let result = sqlx::query(
+            "UPDATE microevents \
+             SET archive = true, updated_at = ? \
+             WHERE archive = false \
+               AND end_time IS NOT NULL \
+               AND end_time < ?",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn find_active(&self) -> Result<Vec<Microevent>, AppError> {
         let rows = sqlx::query_as::<_, Microevent>(
             "SELECT id, event_id, user_id, name, archive, description,
@@ -214,7 +238,7 @@ mod tests {
     //! other contexts as they get their own coverage.
 
     use super::*;
-    use chrono::{TimeZone, Utc};
+    use chrono::{DateTime, TimeZone, Utc};
     use sqlx::sqlite::SqlitePoolOptions;
 
     async fn setup_pool() -> sqlx::SqlitePool {
@@ -558,5 +582,81 @@ mod tests {
         let ids: Vec<i64> = active.iter().map(|r| r.id).collect();
         assert!(!ids.contains(&a), "archived row leaked");
         assert!(ids.contains(&b), "active row missing");
+    }
+
+    // -----------------------------------------------------------------
+    // auto_archive_past — the sweep that retires past microevents
+    // -----------------------------------------------------------------
+
+    /// Build a microevent with explicit timestamps for testing the
+    /// auto-archive sweep. The standard `sample_microevent` helper
+    /// hardcodes a 2026 time which is the wrong era for the past/future
+    /// distinction we're pinning here.
+    fn microevent_with_times(
+        name: &str,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> Microevent {
+        Microevent {
+            id: 0,
+            event_id: 1,
+            user_id: "user-1".to_string(),
+            name: name.to_string(),
+            archive: false,
+            // `description` is NOT NULL in the schema — pass a placeholder
+            // so the INSERT doesn't 1299 on the unrelated constraint.
+            description: Some("test microevent".to_string()),
+            start_time: start,
+            end_time: end,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_archive_past_targets_only_past_microevents() {
+        let pool = setup_pool().await;
+        let ctx = MicroeventContext::new(pool);
+
+        let past = ctx
+            .create(&microevent_with_times(
+                "Past Slot",
+                Some(Utc.with_ymd_and_hms(2020, 6, 15, 14, 0, 0).unwrap()),
+                Some(Utc.with_ymd_and_hms(2020, 6, 15, 16, 0, 0).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let future = ctx
+            .create(&microevent_with_times(
+                "Future Slot",
+                Some(Utc.with_ymd_and_hms(2099, 8, 1, 10, 0, 0).unwrap()),
+                Some(Utc.with_ymd_and_hms(2099, 8, 1, 12, 0, 0).unwrap()),
+            ))
+            .await
+            .unwrap();
+        let tba = ctx
+            .create(&microevent_with_times("TBA Slot", None, None))
+            .await
+            .unwrap();
+
+        let n = ctx.auto_archive_past().await.expect("auto-archive");
+        assert_eq!(n, 1, "only the past microevent should be archived");
+
+        assert!(
+            ctx.find_by_id(past).await.unwrap().archive,
+            "past microevent must be archived"
+        );
+        assert!(
+            !ctx.find_by_id(future).await.unwrap().archive,
+            "future microevent must stay active"
+        );
+        assert!(
+            !ctx.find_by_id(tba).await.unwrap().archive,
+            "TBA microevent (NULL end_time) must stay active"
+        );
+
+        // Idempotent: re-sweep is a no-op.
+        let again = ctx.auto_archive_past().await.expect("second sweep");
+        assert_eq!(again, 0);
     }
 }
