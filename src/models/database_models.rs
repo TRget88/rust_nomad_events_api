@@ -2,7 +2,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use sqlx::SqlitePool;
 
 //####################################################################
 //Event model
@@ -31,6 +30,10 @@ pub struct EventRow {
 //####################################################################
 //microevent model
 //####################################################################
+// `MicroeventRow` is a staged row-shape — the live microevent path uses
+// `Microevent` from `microevents_models.rs` directly via `FromRow`. Kept
+// here so the future shape-split (row vs. DTO) has a place to land.
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 pub struct MicroeventRow {
     pub id: i64,
@@ -48,6 +51,12 @@ pub struct MicroeventRow {
 //####################################################################
 //camping profile model
 //####################################################################
+// `CampingProfileRow` is currently row-loaded via this shape in
+// `CampingProfileContext::get_all`, but only `id` and `camping_data` are
+// surfaced into the public DTO — `profile_name` and `description` come
+// back along for the ride for future routes (e.g. an admin list view
+// that needs them). The fields are documented here on purpose.
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 pub struct CampingProfileRow {
     pub id: i64,
@@ -122,11 +131,25 @@ pub struct UserEventDataRow {
     pub saved_microevents: Vec<i64>,
     pub created_events: Vec<i64>,
     pub created_microevents: Vec<i64>,
+    /// Events on the user's personal calendar/schedule. Distinct from
+    /// saved_events (bookmarks/library) — populated by the "Add to My
+    /// Schedule" button on event detail. Defaulted at the DB layer
+    /// (`'[]'` per migration 00005) so older rows still deserialize.
+    pub scheduled_events: Vec<i64>,
+    /// Microevents on the user's personal calendar/schedule. Sister of
+    /// `scheduled_events` — added so microevents have their own
+    /// deliberate scheduling decision rather than being inferred from
+    /// saved/favorited membership. Defaulted at the DB layer (`'[]'`
+    /// per migration 00006) so older rows still deserialize.
+    pub scheduled_microevents: Vec<i64>,
 }
 
 //####################################################################
 //Analytics Model
 //####################################################################
+// `DailyAnalytics` is a staged row-shape for the analytics-implementation
+// item in ROADMAP.md. None of the live code reads it yet.
+#[allow(dead_code)]
 #[derive(Debug, Serialize, Deserialize, FromRow)]
 pub struct DailyAnalytics {
     pub date: String, // "2025-12-19"

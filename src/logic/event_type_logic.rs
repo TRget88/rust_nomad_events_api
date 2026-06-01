@@ -3,9 +3,7 @@
 // ============================================================================
 use crate::context::EventTypeContext;
 use crate::errors::AppError;
-use crate::models::event_models::{EventType, NomEvent};
-//use crate::repositories::EventRepository;
-use serde_json::json;
+use crate::models::event_models::EventType;
 
 pub struct EventTypeLogic {
     repository: EventTypeContext,

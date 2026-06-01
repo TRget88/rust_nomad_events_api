@@ -1,10 +1,11 @@
+// Most of this module is commented-out future-work; only `log_activity`
+// and `track_event_view` are wired (and even those have no caller yet —
+// they back the "Analytics implementation" item in ROADMAP.md). Allowing
+// dead_code at module level keeps the staged surface documented without
+// drowning the build in 30+ warnings until callers land.
+#![allow(dead_code)]
+
 use crate::errors::AppError;
-//use crate::models::analytics::DailyAnalytics;
-use crate::models::analytics::RealtimeDashboard;
-use crate::models::analytics::TodayMetrics;
-//use crate::models::analytics::WeekMetrics;
-//use crate::models::analytics::AllTimeMetrics;
-use chrono::{DateTime, NaiveDate, Utc};
 use sqlx::SqlitePool;
 
 pub struct AnalyticsContext {

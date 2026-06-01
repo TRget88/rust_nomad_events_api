@@ -1,0 +1,93 @@
+name: CI
+
+# Runs on every push to main and every PR targeting main. Block merges on
+# red. Gates: `cargo fmt --check`, `cargo build`, `cargo clippy -D warnings`,
+# `cargo test`, `cargo audit`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Daily run so a freshly-disclosed advisory against a pinned dep
+  # surfaces on its own schedule, not just on the next PR. Time picked
+  # for low GHA contention (early UTC); adjust if it clashes with peak.
+  schedule:
+    - cron: '17 4 * * *'
+
+# Cancel in-progress runs when a new commit lands on the same PR — no point
+# burning CI minutes on a stale revision.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Pinned to stable so a nightly toolchain shift doesn't surprise us.
+      # The repo uses Rust 2024 edition; stable handles it. We add the
+      # `rustfmt` component so `cargo fmt` is available — stable usually
+      # ships it but listing it explicitly is the safe default.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Caches ~/.cargo/registry, ~/.cargo/git, and target/. First run on a
+      # cold cache builds everything; subsequent runs are dramatically faster.
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      # Formatting gate. Runs before build/test because it's the cheapest
+      # check — surfaces a "you forgot `cargo fmt`" PR comment in seconds
+      # rather than after the full build. `--check` exits non-zero on any
+      # diff; the repo's source is kept fmt-clean by convention.
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      # `--locked` makes the build fail if Cargo.lock would change — keeps
+      # the lockfile honest across PRs.
+      - name: Build
+        run: cargo build --locked
+
+      # Lint gate. Treats every clippy warning as an error so the bar
+      # doesn't drift over time. `--all-targets` covers tests + benches +
+      # examples (matches what we run locally). The codebase was swept of
+      # the pre-existing 80 warnings + 42 clippy violations before this
+      # gate was added; a fresh PR that re-introduces any of them fails.
+      - name: cargo clippy
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
+
+      # Includes integration tests that boot an in-memory sqlx pool and run
+      # our `migrations/` sequence. JWT_SECRET is required by auth-middleware
+      # tests; the value is dummy and never leaves CI.
+      - name: Run tests
+        env:
+          JWT_SECRET: ci-test-secret-not-for-production
+        run: cargo test --all-features --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    # `audit` runs in parallel with the build job — independent of the
+    # toolchain cache so a slow build doesn't delay the vulnerability
+    # signal. The action installs a pre-built `cargo-audit` binary, so
+    # no source compile.
+    steps:
+      - uses: actions/checkout@v4
+      # `rustsec/audit-check` reads `Cargo.lock`, looks up every pinned
+      # version in the RustSec Advisory DB, and fails on any open
+      # advisory. The action surfaces matches as GitHub annotations on
+      # the PR diff, so an advisory against e.g. an old `axum` line
+      # shows up where the dep is declared.
+      - name: cargo audit
+        uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

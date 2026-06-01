@@ -1,6 +1,11 @@
 // src/custom_middleware/cors.rs
+//
+// Custom CORS layer is stubbed out — `tower-http`'s `CorsLayer` is used
+// directly from `main.rs` instead. The placeholder below is kept as a
+// reference for the previous shape.
+//
 //use tower_http::cors::{CorsLayer, Any};
-use axum::http::Method;
+//use axum::http::Method;
 
 //pub fn configure_cors() -> CorsLayer {
 //CorsLayer::new()
