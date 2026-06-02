@@ -6,10 +6,10 @@ use crate::errors::AppError;
 use crate::logic::UserCollectionLogic;
 use crate::models::database_models::EventRow;
 use crate::models::dto::{EventResponse, EventSortOrder};
-use crate::models::event_models::NomEvent;
+use crate::models::event_models::{NomEvent, RecurrenceInterval, RecurrenceUnit};
 use crate::models::user::{Claims, UserRole};
 use crate::util::validate_pagination;
-use chrono::{DateTime, Datelike, Duration, Utc};
+use chrono::{DateTime, Duration, Months, Utc};
 use std::sync::Arc;
 
 pub struct EventLogic {
@@ -305,12 +305,17 @@ impl EventLogic {
         Ok(())
     }
 
-    /// Bump the year on every recurring-annual event whose date has
-    /// already passed. For each matching row:
+    /// Advance every recurring event whose date has already passed to its
+    /// next occurrence. "Recurring" means the row carries an explicit
+    /// `recurrence_interval` or the legacy `recurring_annual` flag (see
+    /// `EventContext::find_past_recurring`). For each matching row:
     ///
-    ///   * `start_date` += 1 year (preserving month/day; Feb 29 → Feb 28)
-    ///   * `end_date`   += 1 year (same rule)
-    ///   * `date_verified = false` (the bump is approximate — most
+    ///   * `start_date` / `end_date` shift forward by one period of the
+    ///     event's cadence — one year for `recurring_annual`, otherwise
+    ///     whatever `recurrence_interval` specifies (annual, biennial,
+    ///     monthly, ...). Month/day is preserved, with Feb 29 → Feb 28 in
+    ///     a common year. See `advance_event_to_next_occurrence`.
+    ///   * `date_verified = false` (the shift is approximate — most
     ///     festivals fall on a calendar weekend, not a calendar date,
     ///     so the user has to confirm the new exact day)
     ///
@@ -340,8 +345,8 @@ impl EventLogic {
                     continue;
                 }
             };
-            let bumped = bump_event_year(event);
-            match self.repository.update(row.id, &bumped).await {
+            let advanced = advance_event_to_next_occurrence(event);
+            match self.repository.update(row.id, &advanced).await {
                 Ok(true) => rolled += 1,
                 Ok(false) => {
                     // Race: the row was deleted between find and
@@ -418,31 +423,65 @@ impl EventLogic {
     }
 }
 
-/// Bump the year on both date fields by one and clear `date_verified`.
-/// Pure function (no DB I/O) so the year-arithmetic edge cases are
-/// pinnable by unit tests.
+/// Advance a recurring event's dates to its next occurrence and clear
+/// `date_verified`. The generalized successor to the old year-only
+/// `bump_event_year`: it shifts both date fields forward by exactly one
+/// period of the event's recurrence cadence (see `effective_interval`
+/// for how that cadence is resolved), then flips `date_verified` off —
+/// the new dates are an estimate the owner should reconfirm, since
+/// festivals usually track a weekday ("third weekend of June") rather
+/// than a fixed calendar date.
 ///
-/// **Feb 29 handling:** `DateTime::with_year(year + 1)` returns `None`
-/// when the same month/day doesn't exist in the new year (i.e.
-/// 2024-02-29 → 2025-02-29 doesn't exist). The fallback subtracts a
-/// day to land on Feb 28, which is the conventional "next year" for
-/// a leap-day event. Festivals reschedule around leap years anyway,
-/// and the `date_verified = false` flag prompts the user to confirm.
-pub(crate) fn bump_event_year(mut event: NomEvent) -> NomEvent {
-    event.date_info.start_date = event.date_info.start_date.map(bump_year);
-    event.date_info.end_date = event.date_info.end_date.map(bump_year);
+/// Pure (no DB I/O, no clock read) so the calendar edge cases stay
+/// unit-pinnable. Year/month shifts use chrono's `checked_add_months`,
+/// which clamps an out-of-range target day to the last valid day of the
+/// month (Jan 31 + 1 month → Feb 28/29; Feb 29 + 1 year → Feb 28 in a
+/// common year). Week shifts add `7 * count` days.
+///
+/// Advances by a single period per call. An event stale by more than one
+/// period is re-selected on the next retention sweep and steps forward
+/// again, so it converges on a future date without this function having
+/// to read the clock.
+pub(crate) fn advance_event_to_next_occurrence(mut event: NomEvent) -> NomEvent {
+    // The roll only ever runs this on rows the DB flagged recurring, so a
+    // missing interval (a legacy row with neither field set) safely
+    // defaults to the historical annual behavior.
+    let interval = effective_interval(&event).unwrap_or_else(RecurrenceInterval::annual);
+    event.date_info.start_date = event
+        .date_info
+        .start_date
+        .map(|d| advance_date(d, interval));
+    event.date_info.end_date = event.date_info.end_date.map(|d| advance_date(d, interval));
     event.date_verified = false;
     event
 }
 
-fn bump_year(dt: DateTime<Utc>) -> DateTime<Utc> {
-    dt.with_year(dt.year() + 1).unwrap_or_else(|| {
-        // Feb 29 path: subtract a day, then bump — Feb 28 always
-        // exists in the next year.
-        (dt - Duration::days(1))
-            .with_year(dt.year() + 1)
-            .unwrap_or(dt) // shouldn't happen; preserve original on impossible path
-    })
+/// Resolve the cadence the auto-roll should advance an event by.
+/// Precedence:
+///   1. an explicit `recurrence_interval` (the new source of truth),
+///   2. else `recurring_annual == true` → one calendar year (the legacy
+///      bridge, kept until every row carries an explicit interval),
+///   3. else `None` — the event isn't flagged recurring on either field.
+pub(crate) fn effective_interval(event: &NomEvent) -> Option<RecurrenceInterval> {
+    event
+        .recurrence_interval
+        .or_else(|| event.recurring_annual.then(RecurrenceInterval::annual))
+}
+
+/// Shift one timestamp forward by a single `interval` period. See
+/// `advance_event_to_next_occurrence` for the day-clamping semantics.
+fn advance_date(dt: DateTime<Utc>, interval: RecurrenceInterval) -> DateTime<Utc> {
+    match interval.unit {
+        // `7 * count` days; `count` is bounded by `validate_event`, so the
+        // multiply can't realistically overflow.
+        RecurrenceUnit::Week => dt + Duration::days(7 * interval.count as i64),
+        RecurrenceUnit::Month => dt
+            .checked_add_months(Months::new(interval.count))
+            .unwrap_or(dt),
+        RecurrenceUnit::Year => dt
+            .checked_add_months(Months::new(12u32.saturating_mul(interval.count)))
+            .unwrap_or(dt),
+    }
 }
 
 /// Convert an `EventRow` to `EventResponse`, logging and dropping rows
@@ -477,6 +516,10 @@ pub(crate) fn validate_event(event: &NomEvent) -> Result<(), AppError> {
     const MAX_NAME_LEN: usize = 200;
     const MAX_DESC_LEN: usize = 5000;
     const MAX_WEBSITE_LEN: usize = 2048;
+    // Upper bound on a recurrence count — "every 100 years/months/weeks"
+    // is already well past anything real, and the cap guards the
+    // year-shift multiply in `advance_date` from overflow.
+    const MAX_RECURRENCE_COUNT: u32 = 100;
 
     if event.name.trim().is_empty() {
         return Err(AppError::ValidationError(
@@ -508,6 +551,20 @@ pub(crate) fn validate_event(event: &NomEvent) -> Result<(), AppError> {
         return Err(AppError::ValidationError(
             "Website URL is too long".to_string(),
         ));
+    }
+
+    // Recurrence cadence sanity: a present interval must advance the
+    // event by at least one period — count 0 would never move a past
+    // event forward, so the roll would re-select it every sweep — and
+    // is capped so the year-shift multiply in `advance_date` can't
+    // overflow.
+    if let Some(interval) = event.recurrence_interval
+        && !(1..=MAX_RECURRENCE_COUNT).contains(&interval.count)
+    {
+        return Err(AppError::ValidationError(format!(
+            "Recurrence interval count must be between 1 and {}",
+            MAX_RECURRENCE_COUNT
+        )));
     }
 
     // String length bound for the location address. Empty is a
@@ -693,7 +750,9 @@ pub(crate) fn validate_name_contains(input: Option<&str>) -> Result<Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::event_models::{EventDate, Location, NomEvent};
+    use crate::models::event_models::{
+        EventDate, Location, NomEvent, RecurrenceInterval, RecurrenceUnit,
+    };
 
     fn make_event(name: &str, description: &str) -> NomEvent {
         NomEvent {
@@ -731,6 +790,7 @@ mod tests {
             recurring: false,
             recurring_annual: false,
             date_verified: false,
+            recurrence_interval: None,
         }
     }
 
@@ -1047,13 +1107,14 @@ mod tests {
     }
 
     // -------------------------------------------------------------
-    // bump_event_year — pure year-arithmetic on the date_info dates
+    // advance_event_to_next_occurrence — pure cadence arithmetic on
+    // the date_info dates
     // -------------------------------------------------------------
     //
-    // The bump is approximate (festivals usually fall on a weekend,
+    // The shift is approximate (festivals usually fall on a weekend,
     // not a fixed calendar date), so `date_verified` is always
     // cleared. The pure-function shape lets us exercise the leap-day
-    // edge case without spinning up a DB.
+    // and day-clamp edge cases without spinning up a DB.
 
     use chrono::TimeZone;
 
@@ -1062,61 +1123,142 @@ mod tests {
     }
 
     #[test]
-    fn bump_event_year_advances_both_dates_by_one_year() {
+    fn advance_annual_event_advances_both_dates_by_one_year() {
         let mut event = make_event("Annual Fest", "desc");
         event.date_info.start_date = Some(dt(2026, 7, 4));
         event.date_info.end_date = Some(dt(2026, 7, 6));
         event.recurring_annual = true;
         event.date_verified = true;
 
-        let bumped = bump_event_year(event);
-        assert_eq!(bumped.date_info.start_date, Some(dt(2027, 7, 4)));
-        assert_eq!(bumped.date_info.end_date, Some(dt(2027, 7, 6)));
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2027, 7, 4)));
+        assert_eq!(advanced.date_info.end_date, Some(dt(2027, 7, 6)));
         // Auto-roll always clears verification — the new date is a
         // guess and the owner must reconfirm.
-        assert!(!bumped.date_verified);
+        assert!(!advanced.date_verified);
     }
 
     #[test]
-    fn bump_event_year_leap_day_falls_back_to_feb_28() {
+    fn advance_annual_leap_day_falls_back_to_feb_28() {
         // 2024-02-29 → 2025-02-29 doesn't exist; conventional
         // behavior is to land on Feb 28 of the new year.
         let mut event = make_event("Leap Day Fest", "desc");
         event.date_info.start_date = Some(dt(2024, 2, 29));
         event.date_info.end_date = Some(dt(2024, 2, 29));
+        event.recurring_annual = true;
 
-        let bumped = bump_event_year(event);
-        assert_eq!(bumped.date_info.start_date, Some(dt(2025, 2, 28)));
-        assert_eq!(bumped.date_info.end_date, Some(dt(2025, 2, 28)));
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2025, 2, 28)));
+        assert_eq!(advanced.date_info.end_date, Some(dt(2025, 2, 28)));
     }
 
     #[test]
-    fn bump_event_year_preserves_null_dates() {
+    fn advance_preserves_null_dates() {
         // Some seasonal events have NULL start/end_date (the
-        // Renaissance Faire cluster, etc.). The bump should leave
+        // Renaissance Faire cluster, etc.). The shift should leave
         // them alone — there's nothing to advance — and still flip
         // date_verified off so the owner is prompted to fill them in.
         let mut event = make_event("No-Date Fest", "desc");
         event.date_info.start_date = None;
         event.date_info.end_date = None;
+        event.recurring_annual = true;
         event.date_verified = true;
 
-        let bumped = bump_event_year(event);
-        assert!(bumped.date_info.start_date.is_none());
-        assert!(bumped.date_info.end_date.is_none());
-        assert!(!bumped.date_verified);
+        let advanced = advance_event_to_next_occurrence(event);
+        assert!(advanced.date_info.start_date.is_none());
+        assert!(advanced.date_info.end_date.is_none());
+        assert!(!advanced.date_verified);
     }
 
     #[test]
-    fn bump_event_year_handles_start_without_end() {
-        // Single-day events: start_date set, end_date null. The bump
+    fn advance_handles_start_without_end() {
+        // Single-day events: start_date set, end_date null. The shift
         // should advance start and leave end null.
         let mut event = make_event("One Day Fest", "desc");
         event.date_info.start_date = Some(dt(2025, 11, 15));
         event.date_info.end_date = None;
+        event.recurring_annual = true;
 
-        let bumped = bump_event_year(event);
-        assert_eq!(bumped.date_info.start_date, Some(dt(2026, 11, 15)));
-        assert!(bumped.date_info.end_date.is_none());
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2026, 11, 15)));
+        assert!(advanced.date_info.end_date.is_none());
+    }
+
+    #[test]
+    fn advance_biennial_event_adds_two_years() {
+        // An explicit { year, 2 } cadence advances by two calendar years.
+        let mut event = make_event("Biennale", "desc");
+        event.date_info.start_date = Some(dt(2026, 5, 1));
+        event.date_info.end_date = Some(dt(2026, 11, 1));
+        event.recurrence_interval = Some(RecurrenceInterval::new(RecurrenceUnit::Year, 2));
+
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2028, 5, 1)));
+        assert_eq!(advanced.date_info.end_date, Some(dt(2028, 11, 1)));
+    }
+
+    #[test]
+    fn advance_monthly_event_clamps_overflowing_day() {
+        // { month, 1 } from Jan 31 must clamp to the last valid day of
+        // the target month (Feb 28 in 2026, a common year) rather than
+        // spilling into March.
+        let mut event = make_event("Monthly Meetup", "desc");
+        event.date_info.start_date = Some(dt(2026, 1, 31));
+        event.date_info.end_date = None;
+        event.recurrence_interval = Some(RecurrenceInterval::new(RecurrenceUnit::Month, 1));
+
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2026, 2, 28)));
+    }
+
+    #[test]
+    fn advance_weekly_event_adds_seven_days_per_count() {
+        // { week, 3 } advances by 21 days, crossing the month boundary.
+        let mut event = make_event("Triweekly Market", "desc");
+        event.date_info.start_date = Some(dt(2026, 6, 15));
+        event.date_info.end_date = Some(dt(2026, 6, 15));
+        event.recurrence_interval = Some(RecurrenceInterval::new(RecurrenceUnit::Week, 3));
+
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2026, 7, 6)));
+        assert_eq!(advanced.date_info.end_date, Some(dt(2026, 7, 6)));
+    }
+
+    #[test]
+    fn recurrence_interval_wins_over_recurring_annual() {
+        // When both are set, the explicit interval is the source of
+        // truth — a { year, 2 } event must not collapse to the legacy
+        // one-year shift implied by recurring_annual.
+        let mut event = make_event("Both Flags", "desc");
+        event.date_info.start_date = Some(dt(2026, 3, 10));
+        event.recurring_annual = true;
+        event.recurrence_interval = Some(RecurrenceInterval::new(RecurrenceUnit::Year, 2));
+
+        let advanced = advance_event_to_next_occurrence(event);
+        assert_eq!(advanced.date_info.start_date, Some(dt(2028, 3, 10)));
+    }
+
+    #[test]
+    fn effective_interval_resolution_order() {
+        // 1. explicit interval wins over recurring_annual.
+        let mut event = make_event("E", "desc");
+        event.recurring_annual = true;
+        event.recurrence_interval = Some(RecurrenceInterval::new(RecurrenceUnit::Month, 6));
+        assert_eq!(
+            effective_interval(&event),
+            Some(RecurrenceInterval::new(RecurrenceUnit::Month, 6))
+        );
+
+        // 2. recurring_annual alone → one calendar year.
+        let mut event = make_event("E", "desc");
+        event.recurring_annual = true;
+        assert_eq!(
+            effective_interval(&event),
+            Some(RecurrenceInterval::annual())
+        );
+
+        // 3. neither flag → None.
+        let event = make_event("E", "desc");
+        assert_eq!(effective_interval(&event), None);
     }
 }

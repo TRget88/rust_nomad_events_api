@@ -19,3 +19,5 @@ pub mod audit_log_context;
 pub use audit_log_context::AuditLogContext;
 pub mod refresh_token_context;
 pub use refresh_token_context::RefreshTokenContext;
+pub mod event_ownership_request_context;
+pub use event_ownership_request_context::EventOwnershipRequestContext;

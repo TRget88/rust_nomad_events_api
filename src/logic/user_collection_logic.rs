@@ -212,6 +212,17 @@ impl UserCollectionLogic {
 
     ///Add ownership of events and microevents
     pub async fn event_ownership(&self, id: i64, user_id: &String) -> Result<Vec<i64>, AppError> {
+        // creator_id (migration 00009) is the authoritative owner. Claim it
+        // when the event is currently unowned — this is the single hook that
+        // sets the column for EVERY initial-assignment path (create_event,
+        // the route seed helper, and test seeds all route through here)
+        // without touching those call sites. The claim is a no-op CAS when
+        // the event is already owned, so it never clobbers an owner; a real
+        // *transfer* sets creator_id via EventContext::claim_ownership's CAS
+        // first, leaving this call to update only the derived array cache.
+        self.events_context
+            .claim_ownership(id, user_id, None)
+            .await?;
         let mut data = self.repository.get(user_id.to_string()).await?;
         data.created_events.push(id);
         self.repository.update(&data).await?;
@@ -254,6 +265,16 @@ impl UserCollectionLogic {
         }
         self.repository.update(&data).await?;
         Ok(data.created_microevents)
+    }
+
+    /// Reverse owner lookup used by the ownership-request workflow:
+    /// which user currently owns `event_id` (holds it in their
+    /// `created_events`), or `None` if the event is unowned. Thin
+    /// passthrough to the context; the business rules around what to do
+    /// with the answer (owner approval vs. admin fallback) live in
+    /// `EventOwnershipRequestLogic`.
+    pub async fn find_event_owner(&self, event_id: i64) -> Result<Option<String>, AppError> {
+        self.repository.find_event_owner(event_id).await
     }
 
     //gets

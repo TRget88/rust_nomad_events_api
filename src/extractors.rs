@@ -9,7 +9,7 @@
 use crate::errors::AppError;
 use axum::{
     Json,
-    extract::{FromRequest, Request, rejection::JsonRejection},
+    extract::{FromRequest, OptionalFromRequest, Request, rejection::JsonRejection},
 };
 use serde::de::DeserializeOwned;
 
@@ -38,8 +38,38 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
+        // Fully-qualified: `Json` now implements both `FromRequest` and
+        // `OptionalFromRequest` (the latter for our `Option<ApiJson<_>>`
+        // support below), so a bare `Json::<T>::from_request` is ambiguous.
+        match <Json<T> as FromRequest<S>>::from_request(req, state).await {
             Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => Err(json_rejection_to_app_error(rejection)),
+        }
+    }
+}
+
+/// Makes `Option<ApiJson<T>>` a valid handler argument for endpoints whose
+/// body is optional (e.g. `POST /event/{id}/ownership-request`, where the
+/// note is the only field and a bare bodyless POST is a legitimate "no
+/// note" request). Delegates to axum's `Json` optional semantics: a request
+/// with NO `Content-Type` header yields `Ok(None)`; a JSON content type with
+/// a valid body yields `Ok(Some(_))`; a present-but-malformed body surfaces
+/// the same friendly `AppError::BadRequest` as the non-optional extractor.
+///
+/// Without this impl, `Option<ApiJson<T>>` would not compile — axum 0.8
+/// gates `Option<T>: FromRequest` on `T: OptionalFromRequest`, which our
+/// custom extractor must opt into explicitly.
+impl<T, S> OptionalFromRequest<S> for ApiJson<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        match <Json<T> as OptionalFromRequest<S>>::from_request(req, state).await {
+            Ok(Some(Json(value))) => Ok(Some(ApiJson(value))),
+            Ok(None) => Ok(None),
             Err(rejection) => Err(json_rejection_to_app_error(rejection)),
         }
     }
@@ -106,6 +136,21 @@ mod tests {
 
     fn build_test_app() -> Router {
         Router::new().route("/test", post(echo_handler))
+    }
+
+    /// Handler exercising `Option<ApiJson<T>>`. Reports whether a body was
+    /// present so the optional-extraction tests can assert on it.
+    async fn optional_echo_handler(
+        payload: Option<ApiJson<Payload>>,
+    ) -> Result<axum::response::Response, AppError> {
+        match payload {
+            Some(ApiJson(p)) => Ok((StatusCode::OK, format!("some:{}", p.name)).into_response()),
+            None => Ok((StatusCode::OK, "none".to_string()).into_response()),
+        }
+    }
+
+    fn build_optional_test_app() -> Router {
+        Router::new().route("/test", post(optional_echo_handler))
     }
 
     #[tokio::test]
@@ -226,6 +271,71 @@ mod tests {
             "Expected content-type hint, got: {}",
             text,
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Option<ApiJson<T>> — optional-body endpoints
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn optional_absent_body_yields_none() {
+        // A bodyless POST with no Content-Type header — the shape a
+        // `fetch(url, { method: "POST" })` with no body produces. The
+        // handler must see `None`, not a 400. This is what lets
+        // `POST /event/{id}/ownership-request` accept a "no note" request.
+        let app = build_optional_test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .method("POST")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"none");
+    }
+
+    #[tokio::test]
+    async fn optional_present_valid_body_yields_some() {
+        let app = build_optional_test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .method("POST")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(r#"{"name":"hello"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"some:hello");
+    }
+
+    #[tokio::test]
+    async fn optional_present_but_malformed_body_still_errors() {
+        // Optional means "you may omit the body" — NOT "malformed bodies are
+        // silently ignored". A JSON content-type with a broken body is still
+        // a 400, same as the non-optional extractor.
+        let app = build_optional_test_app();
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/test")
+                    .method("POST")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from("not valid json {{{"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

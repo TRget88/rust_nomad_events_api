@@ -184,12 +184,10 @@ mod tests {
     /// IGNORE, so its rowid depends on insert order vs the seed
     /// types — never assume a particular value.
     async fn sentinel_id(pool: &sqlx::SqlitePool) -> i64 {
-        sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM event_types WHERE name = 'Uncategorized'",
-        )
-        .fetch_one(pool)
-        .await
-        .expect("sentinel exists")
+        sqlx::query_scalar::<_, i64>("SELECT id FROM event_types WHERE name = 'Uncategorized'")
+            .fetch_one(pool)
+            .await
+            .expect("sentinel exists")
     }
 
     fn sample_event_type(name: &str, category: &str) -> EventType {
@@ -474,13 +472,11 @@ mod tests {
         }
 
         // Sanity: both events currently point at Music.
-        let before: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE event_type_id = ?",
-        )
-        .bind(music_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count before");
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type_id = ?")
+            .bind(music_id)
+            .fetch_one(&pool)
+            .await
+            .expect("count before");
         assert_eq!(before, 2);
 
         // Delete the Music type — should succeed because the
@@ -489,22 +485,20 @@ mod tests {
         assert!(deleted);
 
         // Music gone, sentinel now owns both events.
-        let after_music: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE event_type_id = ?",
-        )
-        .bind(music_id)
-        .fetch_one(&pool)
-        .await
-        .expect("count after");
+        let after_music: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type_id = ?")
+                .bind(music_id)
+                .fetch_one(&pool)
+                .await
+                .expect("count after");
         assert_eq!(after_music, 0);
 
-        let after_sentinel: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM events WHERE event_type_id = ?",
-        )
-        .bind(sid)
-        .fetch_one(&pool)
-        .await
-        .expect("count sentinel");
+        let after_sentinel: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_type_id = ?")
+                .bind(sid)
+                .fetch_one(&pool)
+                .await
+                .expect("count sentinel");
         assert_eq!(after_sentinel, 2);
     }
 
@@ -522,12 +516,11 @@ mod tests {
         assert!(result.is_err(), "deleting the sentinel must fail");
 
         // Sentinel still there.
-        let still_there: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM event_types WHERE name = 'Uncategorized'",
-        )
-        .fetch_one(&pool)
-        .await
-        .expect("count sentinel");
+        let still_there: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_types WHERE name = 'Uncategorized'")
+                .fetch_one(&pool)
+                .await
+                .expect("count sentinel");
         assert_eq!(still_there, 1);
     }
 }

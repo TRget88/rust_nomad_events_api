@@ -31,6 +31,17 @@ pub mod actions {
     pub const CAMPING_PROFILE_CREATE: &str = "camping_profile.create";
     pub const CAMPING_PROFILE_UPDATE: &str = "camping_profile.update";
     pub const CAMPING_PROFILE_DELETE: &str = "camping_profile.delete";
+
+    // Event ownership transfer workflow. A user requesting ownership of an
+    // event they didn't create, and the resolution of that request, are
+    // cross-user state changes (they move an event between users'
+    // `created_events`), so each transition is audited. `auto_approve` is
+    // the no-human domain-verification path — logged with a NULL-ish actor
+    // (the requester themselves) and metadata noting the matched domain.
+    pub const EVENT_OWNERSHIP_REQUEST: &str = "event_ownership.request";
+    pub const EVENT_OWNERSHIP_APPROVE: &str = "event_ownership.approve";
+    pub const EVENT_OWNERSHIP_REJECT: &str = "event_ownership.reject";
+    pub const EVENT_OWNERSHIP_AUTO_APPROVE: &str = "event_ownership.auto_approve";
 }
 
 /// Canonical target_type strings. Same logic as the actions module.
@@ -39,6 +50,7 @@ pub mod target_types {
     pub const EVENT: &str = "event";
     pub const EVENT_TYPE: &str = "event_type";
     pub const CAMPING_PROFILE: &str = "camping_profile";
+    pub const EVENT_OWNERSHIP_REQUEST: &str = "event_ownership_request";
 }
 
 /// What an admin caller wants to record. Constructed at the route layer

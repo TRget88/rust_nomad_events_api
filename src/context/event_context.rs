@@ -62,8 +62,8 @@ impl EventContext {
     /// before we get here. ORDER BY id DESC so the newest events come
     /// first — matches the admin-audit-log convention.
     pub async fn find_all(&self, limit: i64, offset: i64) -> Result<Vec<EventRow>, AppError> {
-        let rows = sqlx::query_as::<_, EventRow>(
-            &format!("SELECT
+        let rows = sqlx::query_as::<_, EventRow>(&format!(
+            "SELECT
                 e.id, e.name, e.description, e.website, e.event_type_id,
                 e.latitude, e.longitude, e.start_date, e.end_date, e.camping_allowed, e.event_data,
                 et.name as event_type_name,
@@ -75,8 +75,8 @@ impl EventContext {
              WHERE {RECURRING_VISIBLE_FILTER}
                AND {NOT_ARCHIVED_FILTER}
              ORDER BY e.id DESC
-             LIMIT ?1 OFFSET ?2"),
-        )
+             LIMIT ?1 OFFSET ?2"
+        ))
         .bind(limit)
         .bind(offset)
         .fetch_all(&self.pool)
@@ -144,8 +144,8 @@ impl EventContext {
     }
 
     pub async fn find_by_type(&self, event_type_id: i64) -> Result<Vec<EventRow>, AppError> {
-        let rows = sqlx::query_as::<_, EventRow>(
-            &format!("SELECT
+        let rows = sqlx::query_as::<_, EventRow>(&format!(
+            "SELECT
                 e.id, e.name, e.description, e.website, e.event_type_id,
                 e.latitude, e.longitude, e.start_date, e.end_date, e.camping_allowed, e.event_data,
                 et.name as event_type_name,
@@ -156,8 +156,8 @@ impl EventContext {
              JOIN event_types et ON e.event_type_id = et.id
              WHERE e.event_type_id = ?
                AND {RECURRING_VISIBLE_FILTER}
-               AND {NOT_ARCHIVED_FILTER}"),
-        )
+               AND {NOT_ARCHIVED_FILTER}"
+        ))
         .bind(event_type_id)
         .fetch_all(&self.pool)
         .await?;
@@ -378,6 +378,40 @@ impl EventContext {
         Ok(result.last_insert_rowid())
     }
 
+    /// Atomic compare-and-set on `events.creator_id`, the authoritative
+    /// single-column event-ownership field (migration 00009). Sets
+    /// `creator_id = new_owner` ONLY when the row's current owner equals
+    /// `expected_previous`, and reports whether the row actually moved.
+    ///
+    /// `IS` is SQLite's null-safe equality, so this transparently handles
+    /// the unowned case: pass `expected_previous = None` to claim an event
+    /// only while `creator_id IS NULL` (the initial-assignment path used by
+    /// `UserCollectionLogic::event_ownership`), or `Some(prev)` to move an
+    /// event only while `prev` still holds it (the transfer path).
+    ///
+    /// This CAS is the durable fix for the dual-ownership race (BUGS.md F1):
+    /// when two ownership approvals run concurrently, each calls this with
+    /// the owner it read; the first matches `expected_previous` and wins,
+    /// the second finds the column already moved, affects zero rows, and
+    /// returns `false` — which the caller turns into a 409 instead of
+    /// minting a second owner. Ownership stays single-valued at the DB
+    /// level, not by a best-effort sequence of JSON-array edits.
+    pub async fn claim_ownership(
+        &self,
+        event_id: i64,
+        new_owner: &str,
+        expected_previous: Option<&str>,
+    ) -> Result<bool, AppError> {
+        let result =
+            sqlx::query("UPDATE events SET creator_id = ?1 WHERE id = ?2 AND creator_id IS ?3")
+                .bind(new_owner)
+                .bind(event_id)
+                .bind(expected_previous)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn update(&self, id: i64, event: &NomEvent) -> Result<bool, AppError> {
         let event_json = serde_json::to_string(event)?;
 
@@ -492,6 +526,11 @@ impl EventContext {
         Ok(result.rows_affected())
     }
 
+    /// Past-dated events the auto-roll should advance. An event qualifies
+    /// when its latest date is before today AND it is flagged recurring on
+    /// either path: the legacy `recurring_annual` boolean, or the newer
+    /// `recurrence_interval` object (any non-null value). `EventLogic`
+    /// resolves which cadence to advance by — see `effective_interval`.
     pub async fn find_past_recurring(&self) -> Result<Vec<EventRow>, AppError> {
         // Column order matches `EventRow` (sqlx::FromRow) — 11 native
         // event columns followed by the 4 JOINed event_type columns.
@@ -506,7 +545,8 @@ impl EventContext {
              FROM events e \
              JOIN event_types et ON e.event_type_id = et.id \
              WHERE substr(COALESCE(e.end_date, e.start_date), 1, 10) < date('now') \
-               AND json_extract(e.event_data, '$.recurring_annual') = 1",
+               AND (json_extract(e.event_data, '$.recurring_annual') = 1 \
+                    OR json_extract(e.event_data, '$.recurrence_interval') IS NOT NULL)",
         )
         .fetch_all(&self.pool)
         .await
@@ -884,14 +924,31 @@ mod tests {
         let pool = setup_pool().await;
         let ctx = EventContext::new(pool.clone());
 
-        let past_one_time =
-            insert_event_with_dates(&pool, "Past OneTime", Some("2020-06-01"), Some("2020-06-03"), false).await;
-        let past_recurring =
-            insert_event_with_dates(&pool, "Past Recurring", Some("2020-07-01"), Some("2020-07-03"), true).await;
-        let future_one_time =
-            insert_event_with_dates(&pool, "Future OneTime", Some("2099-08-01"), Some("2099-08-03"), false).await;
-        let tba_one_time =
-            insert_event_with_dates(&pool, "TBA OneTime", None, None, false).await;
+        let past_one_time = insert_event_with_dates(
+            &pool,
+            "Past OneTime",
+            Some("2020-06-01"),
+            Some("2020-06-03"),
+            false,
+        )
+        .await;
+        let past_recurring = insert_event_with_dates(
+            &pool,
+            "Past Recurring",
+            Some("2020-07-01"),
+            Some("2020-07-03"),
+            true,
+        )
+        .await;
+        let future_one_time = insert_event_with_dates(
+            &pool,
+            "Future OneTime",
+            Some("2099-08-01"),
+            Some("2099-08-03"),
+            false,
+        )
+        .await;
+        let tba_one_time = insert_event_with_dates(&pool, "TBA OneTime", None, None, false).await;
 
         let all = ctx.find_all(100, 0).await.expect("find_all");
         let ids: Vec<i64> = all.iter().map(|r| r.id).collect();
@@ -923,15 +980,30 @@ mod tests {
         let pool = setup_pool().await;
         let ctx = EventContext::new(pool.clone());
 
-        let past_one_time =
-            insert_event_with_dates(&pool, "Past Solo", Some("2020-06-01"), Some("2020-06-03"), false).await;
-        let future_one_time =
-            insert_event_with_dates(&pool, "Future Solo", Some("2099-08-01"), Some("2099-08-03"), false).await;
+        let past_one_time = insert_event_with_dates(
+            &pool,
+            "Past Solo",
+            Some("2020-06-01"),
+            Some("2020-06-03"),
+            false,
+        )
+        .await;
+        let future_one_time = insert_event_with_dates(
+            &pool,
+            "Future Solo",
+            Some("2099-08-01"),
+            Some("2099-08-03"),
+            false,
+        )
+        .await;
 
         let rows = ctx.find_by_type(1000).await.expect("find_by_type");
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         assert!(!ids.contains(&past_one_time), "past non-recurring hidden");
-        assert!(ids.contains(&future_one_time), "future non-recurring visible");
+        assert!(
+            ids.contains(&future_one_time),
+            "future non-recurring visible"
+        );
     }
 
     #[tokio::test]
@@ -940,10 +1012,22 @@ mod tests {
         let pool = setup_pool().await;
         let ctx = EventContext::new(pool.clone());
 
-        let past_one_time =
-            insert_event_with_dates(&pool, "Past Local", Some("2020-06-01"), Some("2020-06-03"), false).await;
-        let future_one_time =
-            insert_event_with_dates(&pool, "Future Local", Some("2099-08-01"), Some("2099-08-03"), false).await;
+        let past_one_time = insert_event_with_dates(
+            &pool,
+            "Past Local",
+            Some("2020-06-01"),
+            Some("2020-06-03"),
+            false,
+        )
+        .await;
+        let future_one_time = insert_event_with_dates(
+            &pool,
+            "Future Local",
+            Some("2099-08-01"),
+            Some("2099-08-03"),
+            false,
+        )
+        .await;
 
         // Center on (40, -100) — same as our inserts — with a wide
         // radius so the bounding-box filter is non-restrictive.
@@ -965,7 +1049,10 @@ mod tests {
             .expect("find_nearby");
         let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
         assert!(!ids.contains(&past_one_time), "past non-recurring hidden");
-        assert!(ids.contains(&future_one_time), "future non-recurring visible");
+        assert!(
+            ids.contains(&future_one_time),
+            "future non-recurring visible"
+        );
     }
 
     // -----------------------------------------------------------------
@@ -995,8 +1082,7 @@ mod tests {
 
         // JSON blob updated.
         let row = ctx.find_by_id(id).await.expect("find_by_id");
-        let payload: serde_json::Value =
-            serde_json::from_str(&row.event_data).expect("parse JSON");
+        let payload: serde_json::Value = serde_json::from_str(&row.event_data).expect("parse JSON");
         assert_eq!(payload["archive"], serde_json::Value::Bool(true));
 
         // Now hidden from listings.
@@ -1062,8 +1148,7 @@ mod tests {
             false,
         )
         .await;
-        let tba_one_time =
-            insert_event_with_dates(&pool, "TBA OneTime", None, None, false).await;
+        let tba_one_time = insert_event_with_dates(&pool, "TBA OneTime", None, None, false).await;
 
         let archived_count = ctx
             .auto_archive_past_non_recurring()
@@ -1116,10 +1201,102 @@ mod tests {
         let pool = setup_pool().await;
         let ctx = EventContext::new(pool.clone());
 
-        let past_one_time =
-            insert_event_with_dates(&pool, "Past Direct", Some("2020-06-01"), Some("2020-06-03"), false).await;
+        let past_one_time = insert_event_with_dates(
+            &pool,
+            "Past Direct",
+            Some("2020-06-01"),
+            Some("2020-06-03"),
+            false,
+        )
+        .await;
 
         let direct = ctx.find_by_id(past_one_time).await.expect("find_by_id");
         assert_eq!(direct.id, past_one_time);
+    }
+
+    // -----------------------------------------------------------------
+    // claim_ownership — atomic compare-and-set on creator_id. This is the
+    // single-ownership gate (migration 00009); the dual-ownership race is
+    // only reachable under true concurrency, so we prove the CAS contract
+    // directly here rather than through the (always-re-reads-the-owner)
+    // approve path.
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn claim_ownership_is_an_atomic_compare_and_set() {
+        let pool = setup_pool().await;
+        let ctx = EventContext::new(pool.clone());
+
+        // Fresh events are created unowned — create() never sets creator_id.
+        let id = ctx
+            .create(&sample_event("Race Fest", 33.0, -84.0))
+            .await
+            .expect("create");
+
+        async fn owner(pool: &sqlx::SqlitePool, id: i64) -> Option<String> {
+            sqlx::query_scalar::<_, Option<String>>("SELECT creator_id FROM events WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .expect("read creator_id")
+        }
+
+        assert_eq!(
+            owner(&pool, id).await,
+            None,
+            "create() leaves event unowned"
+        );
+
+        // Claim-if-unowned: expected_previous = None matches creator_id IS NULL.
+        let won = ctx
+            .claim_ownership(id, "user-a", None)
+            .await
+            .expect("claim");
+        assert!(won, "claiming an unowned event wins");
+        assert_eq!(owner(&pool, id).await.as_deref(), Some("user-a"));
+
+        // A second claim-if-unowned no-ops — the row is no longer NULL, so the
+        // CAS matches zero rows. This is what makes routing initial assignment
+        // through event_ownership's claim-if-null safe on an already-owned
+        // event: it can never clobber the existing owner.
+        let again = ctx
+            .claim_ownership(id, "user-b", None)
+            .await
+            .expect("claim again");
+        assert!(!again, "claim-if-null is a no-op once owned");
+        assert_eq!(
+            owner(&pool, id).await.as_deref(),
+            Some("user-a"),
+            "owner unchanged"
+        );
+
+        // Stale transfer: a CAS that expects the WRONG previous owner is
+        // refused — this is the losing side of the concurrent-approval race.
+        let stale = ctx
+            .claim_ownership(id, "user-c", Some("not-the-owner"))
+            .await
+            .expect("stale cas");
+        assert!(!stale, "CAS with a stale expected owner is refused");
+        assert_eq!(
+            owner(&pool, id).await.as_deref(),
+            Some("user-a"),
+            "owner unchanged after stale CAS"
+        );
+
+        // Matching transfer: a CAS that expects the CURRENT owner wins and
+        // moves the row — the winning side of the race.
+        let moved = ctx
+            .claim_ownership(id, "user-c", Some("user-a"))
+            .await
+            .expect("matching cas");
+        assert!(moved, "CAS with the correct expected owner wins");
+        assert_eq!(owner(&pool, id).await.as_deref(), Some("user-c"));
+
+        // Unknown event id: nothing matches, no row moves.
+        let missing = ctx
+            .claim_ownership(999_999, "user-z", None)
+            .await
+            .expect("missing");
+        assert!(!missing, "claiming a nonexistent event affects no rows");
     }
 }

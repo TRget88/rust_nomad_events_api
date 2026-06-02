@@ -194,13 +194,13 @@ mod tests {
 
     use super::*;
     use crate::context::{
-        AuditLogContext, CampingProfileContext, EventContext, EventTypeContext,
-        JwtRevocationContext, MicroeventContext, RefreshTokenContext, UserCollectionContext,
-        UserContext,
+        AuditLogContext, CampingProfileContext, EventContext, EventOwnershipRequestContext,
+        EventTypeContext, JwtRevocationContext, MicroeventContext, RefreshTokenContext,
+        UserCollectionContext, UserContext,
     };
     use crate::logic::{
-        AuditLogLogic, CampingProfileLogic, EventLogic, EventTypeLogic, JwtRevocationLogic,
-        MicroeventLogic, RefreshTokenLogic, UserCollectionLogic, UserLogic,
+        AuditLogLogic, CampingProfileLogic, EventLogic, EventOwnershipRequestLogic, EventTypeLogic,
+        JwtRevocationLogic, MicroeventLogic, RefreshTokenLogic, UserCollectionLogic, UserLogic,
     };
     use axum::Router;
     use axum::body::Body;
@@ -271,6 +271,14 @@ mod tests {
             microevent_context.clone(),
             user_collection_logic.clone(),
         ));
+        let event_ownership_request_context = EventOwnershipRequestContext::new(pool.clone());
+        let ownership_user_context = UserContext::new(pool.clone());
+        let event_ownership_request_logic = Arc::new(EventOwnershipRequestLogic::new(
+            event_ownership_request_context,
+            event_context.clone(),
+            ownership_user_context,
+            user_collection_logic.clone(),
+        ));
         let jwt_revocation_context = JwtRevocationContext::new(pool.clone());
         let jwt_revocation_logic = Arc::new(JwtRevocationLogic::new(jwt_revocation_context));
         let audit_log_context = AuditLogContext::new(pool.clone());
@@ -288,6 +296,7 @@ mod tests {
             jwt_revocation_logic,
             audit_log_logic,
             refresh_token_logic,
+            event_ownership_request_logic,
         })
     }
 

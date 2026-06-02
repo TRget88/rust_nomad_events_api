@@ -2,6 +2,7 @@
 pub mod analytics;
 pub mod auth;
 pub mod camping_profiles;
+pub mod event_ownership;
 pub mod event_type;
 pub mod events;
 pub mod microevents;
