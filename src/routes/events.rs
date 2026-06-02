@@ -242,13 +242,13 @@ mod tests {
 
     use super::*;
     use crate::context::{
-        AuditLogContext, CampingProfileContext, EventContext, EventTypeContext,
-        JwtRevocationContext, MicroeventContext, RefreshTokenContext, UserCollectionContext,
-        UserContext,
+        AuditLogContext, CampingProfileContext, EventContext, EventOwnershipRequestContext,
+        EventTypeContext, JwtRevocationContext, MicroeventContext, RefreshTokenContext,
+        UserCollectionContext, UserContext,
     };
     use crate::logic::{
-        AuditLogLogic, CampingProfileLogic, EventLogic, EventTypeLogic, JwtRevocationLogic,
-        MicroeventLogic, RefreshTokenLogic, UserCollectionLogic, UserLogic,
+        AuditLogLogic, CampingProfileLogic, EventLogic, EventOwnershipRequestLogic, EventTypeLogic,
+        JwtRevocationLogic, MicroeventLogic, RefreshTokenLogic, UserCollectionLogic, UserLogic,
     };
     use axum::Router;
     use axum::body::Body;
@@ -313,6 +313,18 @@ mod tests {
             microevent_context.clone(),
             user_collection_logic.clone(),
         ));
+        // Ownership-request logic — fresh UserContext (the first is moved
+        // into `user_logic`) + fresh EventOwnershipRequestContext, sharing
+        // the event_context and user_collection_logic Arcs. Mirrors the
+        // wiring in `main.rs`.
+        let event_ownership_request_context = EventOwnershipRequestContext::new(pool.clone());
+        let ownership_user_context = UserContext::new(pool.clone());
+        let event_ownership_request_logic = Arc::new(EventOwnershipRequestLogic::new(
+            event_ownership_request_context,
+            event_context.clone(),
+            ownership_user_context,
+            user_collection_logic.clone(),
+        ));
         let jwt_revocation_context = JwtRevocationContext::new(pool.clone());
         let jwt_revocation_logic = Arc::new(JwtRevocationLogic::new(jwt_revocation_context));
         let audit_log_context = AuditLogContext::new(pool.clone());
@@ -330,6 +342,7 @@ mod tests {
             jwt_revocation_logic,
             audit_log_logic,
             refresh_token_logic,
+            event_ownership_request_logic,
         })
     }
 
@@ -340,6 +353,19 @@ mod tests {
         let state = make_app_state(pool);
         Router::new()
             .route("/event/search", get(search))
+            .with_state(state)
+    }
+
+    /// Build a Router mounting just `GET /event/{id}` with NO auth
+    /// middleware — mirroring how the route now sits in `main.rs`'s
+    /// `public_routes` group (API-key + rate-limit only, no JWT layer).
+    /// There is deliberately no claims injector here: the handler must
+    /// resolve an event for a logged-OUT caller, because that's what a
+    /// shared deep-link (`festurah.com/search?event=<id>`) requires.
+    fn build_get_by_id_app(pool: sqlx::SqlitePool) -> Router {
+        let state = make_app_state(pool);
+        Router::new()
+            .route("/event/{id}", get(super::get))
             .with_state(state)
     }
 
@@ -730,5 +756,71 @@ mod tests {
                 .await
                 .expect("count");
         assert_eq!(count.0, 1);
+    }
+
+    // -----------------------------------------------------------------
+    // GET /event/{id} — public single-event fetch (drives share links)
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn get_event_by_id_resolves_without_auth() {
+        // The Share button hands out `festurah.com/search?event=<id>`
+        // links; a logged-OUT recipient must be able to resolve the
+        // event. This route lives in `main.rs`'s `public_routes` group
+        // (API-key only, no JWT layer), so the handler has to work with
+        // NO Claims extension. `build_get_by_id_app` mounts it without a
+        // claims injector to prove exactly that. A regression that
+        // re-added an `Extension<Claims>` extractor (or moved the GET
+        // back behind the JWT layer) would fail here.
+        let pool = setup_pool().await;
+        let id = seed_event(&pool, "Shareable Fest", 1000, 33.0, -84.0).await;
+        let app = build_get_by_id_app(pool);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/event/{}", id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "public GET /event/{{id}} must resolve without a JWT"
+        );
+
+        let bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["id"].as_i64(), Some(id));
+        assert_eq!(parsed["name"], "Shareable Fest");
+    }
+
+    #[tokio::test]
+    async fn get_event_by_id_unknown_returns_404() {
+        // A stale or hand-edited share link (deleted / never-existed id)
+        // must surface as a clean 404, not a 500 — the frontend
+        // deep-link handler treats 404 as "event not found" and falls
+        // back to the normal search view.
+        let pool = setup_pool().await;
+        let app = build_get_by_id_app(pool);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/event/99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 }

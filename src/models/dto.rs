@@ -146,6 +146,13 @@ pub struct EventResponse {
     /// specifically.
     #[serde(default)]
     pub recurring_annual: bool,
+    /// Mirrors `NomEvent.recurrence_interval` — the explicit
+    /// `{ unit, count }` cadence the auto-roll advances by, when set.
+    /// `None` means the event falls back to the `recurring_annual` flag
+    /// above. Surfaced so the frontend can show and edit how often an
+    /// event repeats.
+    #[serde(default)]
+    pub recurrence_interval: Option<RecurrenceInterval>,
     /// Mirrors `NomEvent.date_verified` — true when a human has
     /// confirmed the current-instance dates are correct. The frontend
     /// surfaces an "unverified date" badge when this is false.
@@ -197,6 +204,7 @@ impl EventResponse {
             camping_info: event.camping_info,
             recurring: event.recurring,
             recurring_annual: event.recurring_annual,
+            recurrence_interval: event.recurrence_interval,
             date_verified: event.date_verified,
             archive: event.archive,
             //is_favorite,

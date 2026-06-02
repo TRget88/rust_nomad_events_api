@@ -47,6 +47,55 @@ pub struct NomEvent {
     /// Defaults to false on legacy rows that predate this field.
     #[serde(default)]
     pub date_verified: bool,
+    /// How often this event recurs, as a `{ unit, count }` cadence
+    /// (e.g. `{ year, 1 }` annual, `{ year, 2 }` biennial,
+    /// `{ month, 1 }` monthly). This is the source of truth the
+    /// auto-roll advances by; when it's `None` the roll falls back to
+    /// the legacy `recurring_annual` flag (treated as one year). `None`
+    /// on legacy rows that predate the field — see
+    /// `EventLogic::effective_interval` for the resolution order.
+    #[serde(default)]
+    pub recurrence_interval: Option<RecurrenceInterval>,
+}
+
+/// The unit half of a `RecurrenceInterval`. Serializes lowercase
+/// (`"week"` / `"month"` / `"year"`) so the JSON stored in `event_data`
+/// and surfaced to the frontend stays human-readable.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RecurrenceUnit {
+    Week,
+    Month,
+    #[default]
+    Year,
+}
+
+/// How often a recurring event repeats, as a `{ unit, count }` pair.
+/// A uniform shape (rather than a mixed-variant enum) keeps the stored
+/// JSON predictable and trivial for the frontend to render and edit:
+/// annual = `{ "unit": "year", "count": 1 }`, biennial =
+/// `{ "unit": "year", "count": 2 }`, every-3-weeks =
+/// `{ "unit": "week", "count": 3 }`.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub struct RecurrenceInterval {
+    pub unit: RecurrenceUnit,
+    pub count: u32,
+}
+
+impl RecurrenceInterval {
+    pub const fn new(unit: RecurrenceUnit, count: u32) -> Self {
+        Self { unit, count }
+    }
+
+    /// The most common festival cadence — once per calendar year. Used
+    /// as the auto-roll fallback for events flagged recurring without an
+    /// explicit interval.
+    pub const fn annual() -> Self {
+        Self {
+            unit: RecurrenceUnit::Year,
+            count: 1,
+        }
+    }
 }
 
 fn deserialize_optional_date<'de, D>(deserializer: D) -> Result<Option<DateTime<Utc>>, D::Error>
@@ -437,6 +486,9 @@ mod tests {
             // serialize path. Verification-state coverage lives in
             // its own test below.
             date_verified: false,
+            // Recurrence-interval coverage lives in its own test below;
+            // keep this fixture on the legacy (None) path.
+            recurrence_interval: None,
         };
 
         let raw = serde_json::to_string(&event).expect("serialize");
@@ -477,5 +529,60 @@ mod tests {
         let event: NomEvent = serde_json::from_str(json).expect("deserialize");
         assert!(event.recurring);
         assert!(!event.recurring_annual);
+    }
+
+    #[test]
+    fn recurrence_interval_json_shape() {
+        // Pin the on-wire shape: a uniform { unit, count } object with a
+        // lowercase unit. The frontend renders/edits this directly and a
+        // DB backfill could write it via SQLite `json_set`, so the exact
+        // key/value strings are a contract.
+        let interval = RecurrenceInterval::new(RecurrenceUnit::Year, 2);
+        let raw = serde_json::to_string(&interval).expect("serialize");
+        assert_eq!(raw, r#"{"unit":"year","count":2}"#);
+
+        let parsed: RecurrenceInterval =
+            serde_json::from_str(r#"{"unit":"month","count":3}"#).expect("deserialize");
+        assert_eq!(parsed, RecurrenceInterval::new(RecurrenceUnit::Month, 3));
+    }
+
+    #[test]
+    fn legacy_json_without_recurrence_interval_decodes_to_none() {
+        // The field is `#[serde(default)]`, so the same legacy `event_data`
+        // text every pre-curation row carries must decode with
+        // `recurrence_interval == None`.
+        let event: NomEvent =
+            serde_json::from_str(LEGACY_JSON).expect("legacy JSON must deserialize");
+        assert!(event.recurrence_interval.is_none());
+    }
+
+    #[test]
+    fn recurrence_interval_round_trips_on_event() {
+        // Full NomEvent path: an event carrying an explicit interval must
+        // round-trip through `event_data` JSON with the value intact.
+        let json = r#"{
+            "id": 3,
+            "name": "Biennale",
+            "description": "Every two years",
+            "event_type_id": 1,
+            "date_info": { "start_date": null, "end_date": null,
+                "single_day": false, "early_arrival_available": false,
+                "early_arrival_date": null, "late_departure_available": false },
+            "location_info": { "address": "Venice",
+                "longitude": 12.34, "latitude": 45.43,
+                "venue_name": null, "parking_info": null },
+            "archive": false,
+            "recurring": true,
+            "recurrence_interval": { "unit": "year", "count": 2 }
+        }"#;
+        let event: NomEvent = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(
+            event.recurrence_interval,
+            Some(RecurrenceInterval::new(RecurrenceUnit::Year, 2))
+        );
+
+        let raw = serde_json::to_string(&event).expect("serialize");
+        let parsed: NomEvent = serde_json::from_str(&raw).expect("re-deserialize");
+        assert_eq!(parsed.recurrence_interval, event.recurrence_interval);
     }
 }

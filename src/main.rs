@@ -28,6 +28,7 @@ mod util;
 use context::AuditLogContext;
 use context::CampingProfileContext;
 use context::EventContext;
+use context::EventOwnershipRequestContext;
 use context::EventTypeContext;
 use context::JwtRevocationContext;
 use context::MicroeventContext;
@@ -38,6 +39,7 @@ use custom_middleware::rate_limit::RateLimiter;
 use logic::AuditLogLogic;
 use logic::CampingProfileLogic;
 use logic::EventLogic;
+use logic::EventOwnershipRequestLogic;
 use logic::EventTypeLogic;
 use logic::JwtRevocationLogic;
 use logic::MicroeventLogic;
@@ -67,6 +69,7 @@ pub struct AppState {
     pub jwt_revocation_logic: Arc<JwtRevocationLogic>,
     pub audit_log_logic: Arc<AuditLogLogic>,
     pub refresh_token_logic: Arc<RefreshTokenLogic>,
+    pub event_ownership_request_logic: Arc<EventOwnershipRequestLogic>,
 }
 
 #[tokio::main]
@@ -152,6 +155,22 @@ async fn main() {
         usercollectionlogic.clone(),
     ));
 
+    // Event-ownership-request workflow. Shares the `EventContext` Arc (to
+    // read the target event's website for domain verification) and the
+    // `UserCollectionLogic` Arc (the ownership ledger — reverse-lookup +
+    // the add/remove transfer). It needs a `UserContext` to read the
+    // requester's `email` + `email_verified` (the JWT carries the email
+    // but NOT the verified flag), but the first `UserContext` was moved
+    // into `UserLogic` above, so build a fresh one over the same pool.
+    let ownershiprequestcontext = EventOwnershipRequestContext::new(db.clone());
+    let ownershipusercontext = UserContext::new(db.clone());
+    let eventownershiprequestlogic = Arc::new(EventOwnershipRequestLogic::new(
+        ownershiprequestcontext,
+        eventcontext.clone(),
+        ownershipusercontext,
+        usercollectionlogic.clone(),
+    ));
+
     let jwtrevocationcontext = JwtRevocationContext::new(db.clone());
     let jwtrevocationlogic = Arc::new(JwtRevocationLogic::new(jwtrevocationcontext));
 
@@ -188,6 +207,7 @@ async fn main() {
         jwt_revocation_logic: jwtrevocationlogic.clone(),
         audit_log_logic: auditloglogic,
         refresh_token_logic: refreshtokenlogic.clone(),
+        event_ownership_request_logic: eventownershiprequestlogic,
     });
 
     // Background retention sweep — drops rows past their natural
@@ -343,6 +363,15 @@ async fn main() {
     let public_routes = Router::new()
         .route("/", get(|| async { "Festival Events API" }))
         .route("/event/search", get(routes::events::search))
+        // Single-event fetch by id is public so shared deep-links
+        // (festurah.com/search?event=<id>) resolve for logged-OUT
+        // recipients — the frontend "Share" button hands out these
+        // links. Returns the same `EventResponse` already exposed via
+        // `/event/search`, so nothing new is surfaced. API-key gating +
+        // rate-limiting still apply (layers below). The mutating verbs
+        // for this path stay protected: PUT lives in `jwt_routes`,
+        // DELETE in `admin_super_routes` — both merge onto this path.
+        .route("/event/{id}", get(routes::events::get))
         // Event-type catalog is public catalog data; the search page needs
         // it to populate the type filter, and the search page runs
         // unauthenticated. API-key gating still applies (middleware below).
@@ -384,10 +413,11 @@ async fn main() {
             "/event",
             post(routes::events::create), // .get(routes::events::get_all),
         )
-        .route(
-            "/event/{id}",
-            get(routes::events::get).put(routes::events::update),
-        )
+        // GET moved to `public_routes` (shared deep-links must resolve
+        // for logged-out recipients). PUT stays JWT-gated here; DELETE
+        // is in `admin_super_routes`. Axum merges all three method
+        // handlers for `/event/{id}` into one MethodRouter.
+        .route("/event/{id}", put(routes::events::update))
         // Owner / admin marks the current-instance dates as verified.
         // Auto-roll flips this to false on every year-bump; this
         // route flips it back to true. Permission gate lives in
@@ -400,6 +430,32 @@ async fn main() {
         // toggles above.
         .route("/event/{id}/archive", post(routes::events::archive))
         .route("/event/{id}/unarchive", post(routes::events::unarchive))
+        // Event-ownership-request workflow. All JWT-gated: requesting,
+        // listing your own / incoming requests, and the owner/admin
+        // approve+reject. The fine-grained authz (owner-or-admin on
+        // approve/reject, the verified-domain auto-approval) lives in
+        // `EventOwnershipRequestLogic`, so these sit in the plain
+        // `jwt_routes` group rather than behind an admin role gate.
+        .route(
+            "/event/{id}/ownership-request",
+            post(routes::event_ownership::request),
+        )
+        .route(
+            "/ownership-requests/mine",
+            get(routes::event_ownership::list_mine),
+        )
+        .route(
+            "/ownership-requests/incoming",
+            get(routes::event_ownership::list_incoming),
+        )
+        .route(
+            "/ownership-request/{id}/approve",
+            post(routes::event_ownership::approve),
+        )
+        .route(
+            "/ownership-request/{id}/reject",
+            post(routes::event_ownership::reject),
+        )
         .route(
             "/event/{id}/microevent",
             get(routes::microevents::get_by_event), //.post(routes::microevents::create),
@@ -552,10 +608,7 @@ async fn main() {
         .route("/admin/users/{id}/lock", post(routes::user::lock))
         .route("/admin/users/{id}/unlock", post(routes::user::unlock))
         .route("/admin/audit-log", get(routes::user::list_audit_log))
-        .route(
-            "/admin/analytics/summary",
-            get(routes::analytics::summary),
-        )
+        .route("/admin/analytics/summary", get(routes::analytics::summary))
         .route("/event", get(routes::events::get_all))
         // Layer order (innermost → outermost / last-to-execute → first):
         //   require_admin → user_rate_limit → auth_middleware → handler

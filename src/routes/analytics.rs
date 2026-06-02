@@ -10,9 +10,9 @@
 // Queries are SQLite-flavor SQL — `datetime('now', '-30 days')` is
 // the SQLite idiom for "30 days ago" against TEXT-stored timestamps.
 
-use crate::errors::AppError;
 use crate::AppState;
-use axum::{extract::State, response::IntoResponse, Json};
+use crate::errors::AppError;
+use axum::{Json, extract::State, response::IntoResponse};
 use serde::Serialize;
 use std::sync::Arc;
 
@@ -41,11 +41,9 @@ pub struct AnalyticsSummary {
 /// and the queries are pure aggregates that complete in milliseconds.
 /// If call volume ever justifies it, thread the main pool through
 /// AppState and read from it instead — that's the only refactor.
-pub async fn summary(
-    State(_service): State<Arc<AppState>>,
-) -> Result<impl IntoResponse, AppError> {
-    let database_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://events.db".to_string());
+pub async fn summary(State(_service): State<Arc<AppState>>) -> Result<impl IntoResponse, AppError> {
+    let database_url =
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://events.db".to_string());
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(1)
         .connect(&database_url)

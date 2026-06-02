@@ -19,3 +19,9 @@ pub mod audit_log_logic;
 pub use audit_log_logic::AuditLogLogic;
 pub mod refresh_token_logic;
 pub use refresh_token_logic::RefreshTokenLogic;
+// Pure helper module (no struct to re-export) backing the
+// ownership-request auto-approval path. Callers use
+// `crate::logic::domain_match::domains_match`.
+pub mod domain_match;
+pub mod event_ownership_request_logic;
+pub use event_ownership_request_logic::EventOwnershipRequestLogic;

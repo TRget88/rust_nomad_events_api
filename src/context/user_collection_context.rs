@@ -284,6 +284,37 @@ impl UserCollectionContext {
 
         Ok(())
     }
+
+    /// Owner lookup: which user (if any) currently owns `event_id`.
+    ///
+    /// As of migration 00009 ownership is the authoritative `creator_id`
+    /// column on `events`, so this is a point read of that single column
+    /// rather than the old reverse `json_each` scan across every user's
+    /// `created_events` array. Reading one source of truth is what makes
+    /// the answer unambiguous — there is no longer a way for two users to
+    /// both "look like" the owner (the durable fix for BUGS.md F1).
+    ///
+    /// Returns `None` in two collapsed-together cases: the event has no
+    /// owner (`creator_id IS NULL` — seed / curator-added events nobody
+    /// has claimed) or the event row doesn't exist. The ownership workflow
+    /// treats `None` as the "fall back to admin approval" case (there is no
+    /// current owner to approve the transfer).
+    ///
+    /// NOTE: this method lives on `UserCollectionContext` for historical
+    /// reasons (it predates the column and was a `user_event_data` query);
+    /// it now reads `events`. Kept here to avoid rewiring the
+    /// `UserCollectionLogic::find_event_owner` passthrough and its callers.
+    pub async fn find_event_owner(&self, event_id: i64) -> Result<Option<String>, AppError> {
+        let owner =
+            sqlx::query_scalar::<_, Option<String>>("SELECT creator_id FROM events WHERE id = ?")
+                .bind(event_id)
+                .fetch_optional(&self.pool)
+                .await?
+                // Outer Option = row presence; inner Option = creator_id nullability.
+                // Flatten both "no such event" and "event unowned" to None.
+                .flatten();
+        Ok(owner)
+    }
 }
 
 #[cfg(test)]
@@ -461,5 +492,87 @@ mod tests {
         assert!(row.favorite_events.is_empty());
         assert!(row.saved_events.is_empty());
         assert!(row.created_events.is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // find_event_owner — point read of the authoritative events.creator_id
+    // column (migration 00009; was a reverse json_each scan)
+    // -----------------------------------------------------------------
+
+    /// Insert an `events` row with a chosen id and `creator_id`. FK
+    /// enforcement is off in these tests, so the synthetic creator id need
+    /// not reference a real user; event_type_id=1 / event_data='{}' just
+    /// satisfy the NOT NULL columns.
+    async fn insert_event_owned_by(pool: &sqlx::SqlitePool, id: i64, creator: Option<&str>) {
+        sqlx::query(
+            "INSERT INTO events (id, name, description, event_type_id, event_data, creator_id) \
+             VALUES (?1, ?2, 'desc', 1, '{}', ?3)",
+        )
+        .bind(id)
+        .bind(format!("Event {id}"))
+        .bind(creator)
+        .execute(pool)
+        .await
+        .expect("insert event");
+    }
+
+    #[tokio::test]
+    async fn find_event_owner_returns_the_creating_user() {
+        // Ownership is now the events.creator_id column. Seed an event owned
+        // by a user and confirm the point read returns them.
+        let pool = setup_pool().await;
+        let ctx = UserCollectionContext::new(pool.clone());
+
+        insert_event_owned_by(&pool, 555, Some("owner-user")).await;
+
+        let found = ctx.find_event_owner(555).await.expect("find_event_owner");
+        assert_eq!(found, Some("owner-user".to_string()));
+    }
+
+    #[tokio::test]
+    async fn find_event_owner_returns_none_for_unowned_event() {
+        // Unowned (creator_id IS NULL) — the seed / curator-added event
+        // nobody has claimed — and a nonexistent id both collapse to None.
+        // The workflow maps None to the admin-approval fallback.
+        let pool = setup_pool().await;
+        let ctx = UserCollectionContext::new(pool.clone());
+
+        insert_event_owned_by(&pool, 777, None).await; // exists but unowned
+        insert_event_owned_by(&pool, 778, Some("somebody")).await; // owned, different id
+
+        assert_eq!(
+            ctx.find_event_owner(777).await.expect("unowned"),
+            None,
+            "an event with NULL creator_id is unowned"
+        );
+        assert_eq!(
+            ctx.find_event_owner(999_999).await.expect("missing"),
+            None,
+            "a nonexistent event id is also None"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_event_owner_reads_only_creator_id_not_the_array_caches() {
+        // Critical: ownership is the creator_id column ONLY. A user who has
+        // merely favorited / saved / scheduled an event (the id sits in
+        // those JSON arrays) must NOT look like its owner — otherwise a
+        // transfer could yank an event away from a fan. The event itself is
+        // unowned (creator_id NULL), so the lookup is None regardless of how
+        // many array caches reference it.
+        let pool = setup_pool().await;
+        let ctx = UserCollectionContext::new(pool.clone());
+
+        insert_event_owned_by(&pool, 42, None).await; // unowned event
+
+        let mut fan = ctx.get("fan-not-owner".to_string()).await.expect("get");
+        fan.favorite_events = vec![42];
+        fan.saved_events = vec![42];
+        fan.scheduled_events = vec![42];
+        // deliberately NOT the creator_id of event 42
+        ctx.update(&fan).await.expect("update");
+
+        let found = ctx.find_event_owner(42).await.expect("find_event_owner");
+        assert_eq!(found, None);
     }
 }
